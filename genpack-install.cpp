@@ -34,12 +34,11 @@ static std::set<std::string> common_grub_modules = {
     "part_gpt", "part_msdos", "blocklist", 
     "normal", "configfile", "linux", "chain", 
     "echo",   "test", "probe",  "search",  "gzio", "minicmd","sleep",
-    "all_video", "videotest", "serial", "png", "gfxterm_background", "font", "terminal","videoinfo","gfxterm", "keystatus",
-    "fdt"
+    "all_video", "videotest", "serial", "png", "gfxterm_background", "font", "terminal","videoinfo","gfxterm", "keystatus"
 };
 
 static std::set<std::string> arch_specific_grub_modules = {
-    "ahci", "efi_gop", "efi_uga", "biosdisk", "cpuid", "multiboot", "multiboot2"
+    "ahci", "efi_gop", "efi_uga", "biosdisk", "cpuid", "multiboot", "multiboot2", "fdt"
 };
 
 bool is_dir(const std::filesystem::path& path)
