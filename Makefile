@@ -6,7 +6,7 @@ genpack-install.bin: genpack-install.cpp
 	g++ -std=c++23 -o  $@ $< -lmount -lblkid
 
 install: genpack-install.bin
-	install -m 755 genpack-install.bin $(PREFIX)/bin/genpack-install
+	install -Dm755 genpack-install.bin $(DESTDIR)$(PREFIX)/bin/genpack-install
 
 clean:
 	rm -f *.o *.bin
