@@ -109,7 +109,7 @@ int exec(const std::string& cmd, const std::vector<std::string>& args)
             argv[argc++] = pt;
             pt += arg.length() + 1;
         }
-        argv[argc] = NULL;
+        argv[argc] = nullptr;
         auto rst = execvp(cmd.c_str(), argv);
         free(argv_buf);
         return -1;
@@ -182,7 +182,7 @@ bool is_image_file_loopbacked(const std::filesystem::path& system_image)
     if (pid == 0) { //child
         close(fd[0]);
         dup2(fd[1], STDOUT_FILENO);
-        if (execlp("losetup", "losetup", "-j", system_image.c_str(), NULL) < 0) _exit(-1);
+        if (execlp("losetup", "losetup", "-j", system_image.c_str(), nullptr) < 0) _exit(-1);
     } else { // parent
       close(fd[1]);
       {
@@ -230,7 +230,7 @@ std::list<BlockDevice> lsblk(const std::optional<std::filesystem::path>& device 
     if (pid == 0) { //child
         close(fd[0]);
         dup2(fd[1], STDOUT_FILENO);
-        if (execlp("lsblk", "lsblk", "-bnr", "-o", "NAME,MODEL,TYPE,PKNAME,RO,MOUNTPOINT,SIZE,TRAN,LOG-SEC", device? device.value().c_str() : NULL, NULL) < 0) _exit(-1);
+        if (execlp("lsblk", "lsblk", "-bnr", "-o", "NAME,MODEL,TYPE,PKNAME,RO,MOUNTPOINT,SIZE,TRAN,LOG-SEC", device? device.value().c_str() : nullptr, nullptr) < 0) _exit(-1);
     } else { // parent
       close(fd[1]);
       try {
@@ -368,7 +368,7 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
         auto glob = [](const char* pattern, int flags, int errfunc(const char *epath, int eerrno), std::list<std::filesystem::path>& match) -> int {
             glob_t globbuf;
             match.clear();
-            int rst = ::glob(pattern, GLOB_NOESCAPE, NULL, &globbuf);
+            int rst = ::glob(pattern, GLOB_NOESCAPE, nullptr, &globbuf);
             if (rst == GLOB_NOMATCH) return 0;
             if (rst != 0) throw std::runtime_error("glob");
             //else
@@ -380,7 +380,7 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
         };
 
         std::list<std::filesystem::path> match;
-        glob(pattern, GLOB_NOESCAPE, NULL, match);
+        glob(pattern, GLOB_NOESCAPE, nullptr, match);
         for (auto& path: match) {
             std::ifstream part(path);
             uint16_t partno;
