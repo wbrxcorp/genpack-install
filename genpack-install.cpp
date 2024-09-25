@@ -29,16 +29,19 @@ static const std::filesystem::path boot_partition("/run/initramfs/boot");
 static const std::filesystem::path installed_system_image(boot_partition / "system.img");
 static const std::filesystem::path grub_lib = std::filesystem::path("/usr/lib/grub");
 
+static bool debug = false;
+
 static std::set<std::string> common_grub_modules = {
-    "loopback", "xfs", "btrfs", "fat", "ntfs", "ntfscomp", "ext2",  "iso9660","lvm", "squash4",
+    "loopback", "xfs", "btrfs", "fat", "exfat", "ntfscomp", "ext2",  "iso9660","lvm", "squash4",
     "part_gpt", "part_msdos", "blocklist", 
-    "normal", "configfile", "linux", "chain", 
-    "echo",   "test", "probe",  "search",  "gzio", "minicmd","sleep",
-    "all_video", "videotest", "serial", "png", "gfxterm_background", "font", "terminal","videoinfo","gfxterm", "keystatus"
+    "configfile", "linux", "chain", 
+    "echo",   "test", "probe",  "search",  "minicmd","sleep",
+    "all_video", "videotest", "serial", "png", "gfxterm_background", "videoinfo", "keystatus"
 };
 
 static std::set<std::string> arch_specific_grub_modules = {
-    "ahci", "efi_gop", "efi_uga", "biosdisk", "cpuid", "multiboot", "multiboot2", "fdt"
+    // DO NOT INCLUDE "ahci" HERE.  It makes booting regular PC impossible.
+    "ata", "biosdisk", "cpuid", "multiboot", "multiboot2", "fdt"
 };
 
 bool is_dir(const std::filesystem::path& path)
@@ -51,18 +54,28 @@ bool is_file(const std::filesystem::path& path)
     return std::filesystem::exists(path) && std::filesystem::is_regular_file(path);
 }
 
-const std::vector<std::string> grub_modules(const std::string& arch)
+const std::set<std::string> grub_modules(const std::string& platform)
 {
-    std::vector<std::string> modules(common_grub_modules.begin(), common_grub_modules.end());
+    std::set<std::string> modules;
+    for (const auto& m:common_grub_modules) {
+        modules.insert(m);
+    }
+    
     for (const auto& m:arch_specific_grub_modules) {
-        if (is_file(grub_lib / arch / (m + ".mod"))) {
-            modules.push_back(m);
+        if (is_file(grub_lib / platform / (m + ".mod"))) {
+            modules.insert(m);
+        }
+    }
+    if (debug) {
+        std::cout << "Grub modules for " << platform << ":" << std::endl;
+        for (const auto& m:modules) {
+            std::cout << m << std::endl;
         }
     }
     return modules;
 }
 
-std::string bios_grub_modules_string(const std::vector<std::string>& modules)
+std::string bios_grub_modules_string(const std::set<std::string>& modules)
 {
     std::string str;
     for (const auto& m:modules) {
@@ -70,6 +83,10 @@ std::string bios_grub_modules_string(const std::vector<std::string>& modules)
     }
     // remove last space
     str.pop_back();
+    if (debug) {
+        std::cout << "Grub modules string:" << std::endl;
+        std::cout << str << std::endl;
+    }
     return str;
 }
 
@@ -484,8 +501,15 @@ bool generate_efi_bootloader(const std::string& arch, const std::filesystem::pat
         std::vector<std::string> args = {"-p", "/boot/grub", 
             "-c", grub_cfg.string(),
             "-o", output.string(), "-O", arch};
+        if (debug) args.push_back("--verbose");
         const auto grub_modules = ::grub_modules(arch);
         args.insert(args.end(), grub_modules.begin(), grub_modules.end());
+        if (debug) {
+            std::cout << "grub-mkimage(EFI) args:" << std::endl;
+            for (const auto& arg:args) {
+                std::cout << arg << std::endl;
+            }
+        }
         auto rst = (exec("grub-mkimage", args) == 0);
         if (exec("grub-mkimage", args) != 0) {
             std::cout << "grub-mkimage(EFI) failed." << std::endl;
@@ -812,6 +836,7 @@ int _main(int argc, char** argv)
     program.add_argument("--cdrom").help("Create iso9660 image").default_value(false).implicit_value(true);
     program.add_argument("--additional-boot-files").help("Zip-archived file contains additional boot files");
     program.add_argument("-y").help("Don't ask questions").default_value(false).implicit_value(true);
+    program.add_argument("--debug").help("Show debug messages").default_value(false).implicit_value(true);
 
     try {
         program.parse_args(argc, argv);
@@ -828,6 +853,8 @@ int _main(int argc, char** argv)
         return -1;
     }
     //else
+
+    debug = program.get<bool>("--debug");
 
     try {
         if (geteuid() != 0) throw std::runtime_error("You must be root");
