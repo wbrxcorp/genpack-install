@@ -171,8 +171,11 @@ void check_system_image(const std::filesystem::path& system_image)
     std::filesystem::path tempdir_path(tempdir.get());
     const auto genpack_dir = tempdir_path / ".genpack";
     if (!std::filesystem::is_directory(genpack_dir)) throw std::runtime_error("System image file doesn't contain .genpack directory");
-    if (!std::filesystem::exists(tempdir_path / "boot/kernel")) throw std::runtime_error("System image file doesn't contain kernel image");
-    if (!std::filesystem::exists(tempdir_path / "boot/initramfs")) throw std::runtime_error("System image file doesn't contain initramfs");
+    if (!std::filesystem::exists(tempdir_path / "boot/bootcode.bin")) {
+        // kernel and initramfs is mandatory unless it's raspberry pi image
+        if (!std::filesystem::exists(tempdir_path / "boot/kernel")) throw std::runtime_error("System image file doesn't contain kernel image");
+        if (!std::filesystem::exists(tempdir_path / "boot/initramfs")) throw std::runtime_error("System image file doesn't contain initramfs");
+    }
     //else
     auto print_file = [&genpack_dir](const std::string& filename) {
         std::ifstream i(genpack_dir / filename);
@@ -545,8 +548,30 @@ bool install_bios_bootloader(const std::filesystem::path& disk, const std::files
     return true;
 }
 
-bool install_bootloader(const std::filesystem::path& disk, const std::filesystem::path& boot_partition_dir, bool bios_compatible = true)
+bool install_bootloader(const std::filesystem::path& system_image, const std::filesystem::path& disk, 
+    const std::filesystem::path& boot_partition_dir, const std::string& boot_partition_uuid, bool bios_compatible = true)
 {
+    auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+    std::filesystem::path tempdir_path(tempdir.get());
+
+    if (std::filesystem::exists(tempdir_path / "boot/bootcode.bin")) {
+        // raspberry pi
+        std::cout << "Installing boot files for raspberry pi..." << std::endl;
+        if (exec("cp", {"-a", (tempdir_path / "boot" / ".").string() , boot_partition_dir}) != 0) {
+            std::cerr << "Failed to copy boot files." << std::endl;
+            return false;
+        }
+        if (exec("sed", {"-i", "s/ROOTDEV/systemimg:" + boot_partition_uuid + "/", boot_partition_dir / "cmdline.txt"}) != 0) {
+            std::cerr << "Failed to modify cmdline.txt." << std::endl;
+            return false;
+        }
+        exec("sed", {"-i", "s/rootfstype=[^ ]* //", boot_partition_dir / "cmdline.txt"});
+        std::cout << "Done." << std::endl;
+        return true;
+    }
+
+    //else
+
     bool some_bootloader_installed = false;
     auto efi_boot = boot_partition_dir / "efi/boot";
     auto grub_lib = std::filesystem::path("/usr/lib/grub");
@@ -659,7 +684,7 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
         auto tempdir_path = std::filesystem::path(tempdir.get());
 
         std::cout << "Installing bootloader..." << std::flush;
-        if (!install_bootloader(disk, tempdir_path, bios_compatible)) {
+        if (!install_bootloader(system_image, disk, tempdir_path, boot_partition_uuid, bios_compatible)) {
             std::cout << "Failed" << std::endl;
             return 1;
         }
