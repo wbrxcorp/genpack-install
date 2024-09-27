@@ -789,6 +789,30 @@ int create_iso9660_image(const std::filesystem::path& image, const std::optional
         "system.img=" + system_image.string()});
 }
 
+bool are_files_same(const std::filesystem::path& file1, const std::filesystem::path& file2)
+{
+    if (std::filesystem::file_size(file1) != std::filesystem::file_size(file2)) return false;
+    //else
+    std::ifstream f1(file1, std::ios::binary);
+    std::ifstream f2(file2, std::ios::binary);
+    if (!f1 || !f2) {
+        if (debug) std::cout << "Failed to open file: " << file1 << " or " << file2 << std::endl;
+        return false;
+    }
+    char buf1[4096], buf2[4096];
+    while (true) {
+        f1.read(buf1, sizeof(buf1));
+        f2.read(buf2, sizeof(buf2));
+        std::streamsize bytes_read1 = f1.gcount();
+        std::streamsize bytes_read2 = f2.gcount();
+        if (bytes_read1 != bytes_read2 || memcmp(buf1, buf2, bytes_read1) != 0) {
+            return false;
+        }
+        if (bytes_read1 < sizeof(buf1)) break; // End of file reached
+    }
+    return f1.eof() && f2.eof();
+}
+
 int install_self(const std::filesystem::path& system_image,
     const std::optional<std::filesystem::path>& system_cfg = std::nullopt, const std::optional<std::filesystem::path>& system_ini = std::nullopt)
 {
@@ -822,6 +846,45 @@ int install_self(const std::filesystem::path& system_image,
         }
         if (is_file(new_system_image)) std::filesystem::remove(new_system_image);
         throw e;
+    }
+
+    {
+        // for raspberry pi, all files under /boot should be copied to boot partition
+        auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+        auto tempdir_path = std::filesystem::path(tempdir.get());
+        if (is_file(tempdir_path / "boot" / "bootcode.bin")) {
+            // raspberry pi
+            std::cout << "Installing boot files for raspberry pi..." << std::endl;
+            // first, enum all files under tmpdir_path / "boot" recursively
+            std::vector<std::filesystem::path> files;
+            auto tempdir_path_boot = tempdir_path / "boot";
+            for (const auto& entry: std::filesystem::recursive_directory_iterator(tempdir_path_boot)) {
+                if (entry.is_directory()) {
+                    auto dst_dir = boot_partition / std::filesystem::relative(entry.path(), tempdir_path_boot);
+                    if (!std::filesystem::create_directories(dst_dir) && debug) {
+                        std::cout << "Directory not created: " << dst_dir << std::endl;
+                    }
+                } else if (entry.is_regular_file()) {
+                    files.push_back(entry.path());
+                }
+            }
+            // then, copy all files except config.txt and cmdline.txt to boot partition
+            for (const auto& file: files) {
+                std::filesystem::path relative_path = std::filesystem::relative(file, tempdir_path_boot);
+                if (relative_path == "config.txt" || relative_path == "cmdline.txt") continue;
+                auto dst_path = boot_partition / relative_path;
+                if (std::filesystem::exists(dst_path) && are_files_same(file, dst_path)) {
+                    if (debug) std::cout << "File already exists: " << dst_path << std::endl;
+                    continue;
+                }
+                // else
+                // copy file to dst_path + ".new" and then rename it to dst_path
+                std::filesystem::copy_file(file, dst_path.string() + ".new");
+                std::filesystem::rename(dst_path.string() + ".new", dst_path);
+                if (debug) std::cout << file << std::endl;
+            }
+            std::cout << "Done." << std::endl;
+        }
     }
 
     copy_system_cfg_ini(system_cfg, system_ini, boot_partition);
