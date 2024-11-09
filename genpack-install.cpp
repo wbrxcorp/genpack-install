@@ -717,6 +717,11 @@ int create_iso9660_image(const std::filesystem::path& image, const std::optional
     const std::optional<std::filesystem::path>& system_cfg = std::nullopt, const std::optional<std::filesystem::path>& system_ini = std::nullopt,
     const std::optional<std::string>& label = std::nullopt, const std::optional<std::string>& additional_boot_files = std::nullopt)
 {
+    if (exec("xorriso", {"-version"}) != 0) {
+        std::cerr << "`xorriso -version` failed. Probably xorriso(libisoburn) is not installed." << std::endl;
+        return 1;
+    }
+
     auto system_image = _system_image? _system_image.value() : installed_system_image;
     if (!_system_image) {
         std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
