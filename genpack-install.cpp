@@ -885,6 +885,8 @@ int create_zip_archive(const std::filesystem::path& archive,
     if (!zf) throw std::runtime_error("zipOpen() failed");
     //else
     add_file_to_zip(zf, system_image, "system.img");
+    if (system_cfg) add_file_to_zip(zf, system_cfg.value(), "system.cfg");
+    if (system_ini) add_file_to_zip(zf, system_ini.value(), "system.ini");
 
     // generate bootloader
     for (const auto& [arch, filename]:efi_bootloaders) {
@@ -934,6 +936,11 @@ int create_zip_archive(const std::filesystem::path& archive,
             }
             std::cout << "Done." << std::endl;
         }
+    }
+
+    if (additional_boot_files) {
+        std::cout << "Extracting additional boot files..." << std::endl;
+        throw std::runtime_error("Not implemented yet.");
     }
 
     zipClose(zf, nullptr);
