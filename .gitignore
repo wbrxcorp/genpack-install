@@ -1,3 +1,6 @@
 .vscode
 *.o
 *.bin
+*.squashfs
+*.iso
+*.zip

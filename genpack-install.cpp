@@ -24,10 +24,17 @@
 #include <ext/stdio_filebuf.h> // for __gnu_cxx::stdio_filebuf
 
 #include <argparse/argparse.hpp>
+#include <minizip/zip.h>
 
 static const std::filesystem::path boot_partition("/run/initramfs/boot");
 static const std::filesystem::path installed_system_image(boot_partition / "system.img");
 static const std::filesystem::path grub_lib = std::filesystem::path("/usr/lib/grub");
+
+static const auto efi_bootloaders = {
+    std::make_pair("x86_64-efi", "bootx64.efi"),
+    std::make_pair("i386-efi", "bootia32.efi"),
+    std::make_pair("arm64-efi", "bootaa64.efi")
+};
 
 static bool debug = false;
 
@@ -575,11 +582,6 @@ bool install_bootloader(const std::filesystem::path& system_image, const std::fi
     bool some_bootloader_installed = false;
     auto efi_boot = boot_partition_dir / "efi/boot";
     auto grub_lib = std::filesystem::path("/usr/lib/grub");
-    auto efi_bootloaders = {
-        std::make_pair("x86_64-efi", "bootx64.efi"),
-        std::make_pair("i386-efi", "bootia32.efi"),
-        std::make_pair("arm64-efi", "bootaa64.efi")
-    };
     for (const auto& [arch, filename]:efi_bootloaders) {
         if (is_dir(grub_lib / arch) && generate_efi_bootloader(arch, efi_boot / filename)) {
             std::cout << arch << " bootloader installed." << std::endl;
@@ -722,7 +724,7 @@ int create_iso9660_image(const std::filesystem::path& image, const std::optional
         return 1;
     }
 
-    auto system_image = _system_image? _system_image.value() : installed_system_image;
+    const auto& system_image = _system_image.value_or(installed_system_image);
     if (!_system_image) {
         std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
     }
@@ -792,6 +794,150 @@ int create_iso9660_image(const std::filesystem::path& image, const std::optional
         "-no-emul-boot", "-isohybrid-gpt-basdat",
         "-V", label.value_or("GENPACK-BOOTCD"), "-o", image.string(), tempdir_path.string(),
         "system.img=" + system_image.string()});
+}
+
+size_t add_file_to_zip(zipFile zf, const std::filesystem::path& file, const std::string& zip_path)
+{
+    zip_fileinfo zi;
+    memset(&zi, 0, sizeof(zi));
+    // get system_image timestamp
+    struct stat s;
+    if (stat(file.c_str(), &s) < 0) throw std::runtime_error("stat() failed");
+    // convert file timestamp to tmz_date
+    struct tm* t = localtime(&s.st_mtime);
+    zi.tmz_date.tm_sec = t->tm_sec;
+    zi.tmz_date.tm_min = t->tm_min;
+    zi.tmz_date.tm_hour = t->tm_hour;
+    zi.tmz_date.tm_mday = t->tm_mday;
+    zi.tmz_date.tm_mon = t->tm_mon;
+    zi.tmz_date.tm_year = t->tm_year;
+    
+    auto err = zipOpenNewFileInZip(zf, zip_path.c_str(), &zi, nullptr, 0, nullptr, 0, nullptr, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+    if (err != ZIP_OK) {
+        zipClose(zf, nullptr);
+        throw std::runtime_error("zipOpenNewFileInZip() failed");
+    }
+    //else
+    std::ifstream f(file, std::ios::binary);
+    if (!f) {
+        zipClose(zf, nullptr);
+        throw std::runtime_error("Failed to open file: " + file.string());
+    }
+    char buf[4096];
+    size_t total_read = 0;
+    while (f) {
+        f.read(buf, sizeof(buf));
+        if (f.bad()) {
+            zipClose(zf, nullptr);
+            throw std::runtime_error("Failed to read file: " + file.string());
+        }
+        auto bytes_read = f.gcount();
+        total_read += bytes_read;
+        if (zipWriteInFileInZip(zf, buf, bytes_read) != ZIP_OK) {
+            zipClose(zf, nullptr);
+            throw std::runtime_error("zipWriteInFileInZip() failed");
+        }
+    }
+    zipCloseFileInZip(zf);
+    return total_read;
+}
+
+size_t add_text_to_zip(zipFile zf, const std::string& text, const std::string& zip_path)
+{
+    zip_fileinfo zi;
+    memset(&zi, 0, sizeof(zi));
+    // get system_image timestamp
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    zi.tmz_date.tm_sec = t->tm_sec;
+    zi.tmz_date.tm_min = t->tm_min;
+    zi.tmz_date.tm_hour = t->tm_hour;
+    zi.tmz_date.tm_mday = t->tm_mday;
+    zi.tmz_date.tm_mon = t->tm_mon;
+    zi.tmz_date.tm_year = t->tm_year;
+    
+    auto err = zipOpenNewFileInZip(zf, zip_path.c_str(), &zi, nullptr, 0, nullptr, 0, nullptr, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+    if (err != ZIP_OK) {
+        zipClose(zf, nullptr);
+        throw std::runtime_error("zipOpenNewFileInZip() failed");
+    }
+    //else
+    if (zipWriteInFileInZip(zf, text.c_str(), text.size()) != ZIP_OK) {
+        zipClose(zf, nullptr);
+        throw std::runtime_error("zipWriteInFileInZip() failed");
+    }
+    zipCloseFileInZip(zf);
+    return text.size();
+}
+
+int create_zip_archive(const std::filesystem::path& archive, 
+    const std::optional<std::filesystem::path>& _system_image = std::nullopt,
+    const std::optional<std::filesystem::path>& system_cfg = std::nullopt, 
+    const std::optional<std::filesystem::path>& system_ini = std::nullopt,
+    const std::optional<std::string>& additional_boot_files = std::nullopt)
+{
+    const auto& system_image = _system_image.value_or(installed_system_image);
+    if (!_system_image) {
+        std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
+    }
+
+    auto zf = zipOpen(archive.c_str(), APPEND_STATUS_CREATE);
+    if (!zf) throw std::runtime_error("zipOpen() failed");
+    //else
+    add_file_to_zip(zf, system_image, "system.img");
+
+    // generate bootloader
+    for (const auto& [arch, filename]:efi_bootloaders) {
+        if (is_dir(grub_lib / arch)) {
+            // create tempfile by memfd_create
+            auto rst = with_memfd<bool>("grub.efi", 0, [zf,arch,filename](const auto& tmpfile) {
+                if (generate_efi_bootloader(arch, tmpfile)) {
+                    add_file_to_zip(zf, tmpfile, std::string("efi/boot/") + filename);
+                    return true;
+                }
+                //else
+                return false;
+            });
+            if (rst) {
+                std::cout << arch << " bootloader generated." << std::endl;
+            }
+        }
+    }
+
+    {
+        // for raspberry pi, all files under /boot should be copied to boot partition
+        auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+        auto tempdir_path = std::filesystem::path(tempdir.get());
+        if (is_file(tempdir_path / "boot" / "bootcode.bin")) {
+            // raspberry pi
+            std::cout << "Installing boot files for raspberry pi..." << std::endl;
+            // zip all files under tmpdir_path / "boot" recursively
+            auto tempdir_path_boot = tempdir_path / "boot";
+            for (const auto& entry: std::filesystem::recursive_directory_iterator(tempdir_path_boot)) {
+                if (!entry.is_regular_file()) continue;
+                auto relative_path = std::filesystem::relative(entry.path(), tempdir_path_boot).string();
+                if (relative_path == "cmdline.txt") {
+                    // modify cmdline.txt
+                    std::ifstream f(entry.path());
+                    std::string cmdline;
+                    std::getline(f, cmdline);
+                    // replace "ROOTDEV" to "systemimg:auto"
+                    cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)root=[^ ]*)"), "$1root=systemimg:auto");
+                    // remove "rootfstype=..."
+                    cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)rootfstype=[^ ]*)"), "");
+                    // write modified cmdline.txt to zip
+                    add_text_to_zip(zf, cmdline, relative_path);
+                    continue;
+                }
+                // else 
+                add_file_to_zip(zf, entry.path(), std::filesystem::relative(entry.path(), tempdir_path_boot).string());
+            }
+            std::cout << "Done." << std::endl;
+        }
+    }
+
+    zipClose(zf, nullptr);
+    return 0;
 }
 
 bool are_files_same(const std::filesystem::path& file1, const std::filesystem::path& file2)
@@ -926,7 +1072,8 @@ int _main(int argc, char** argv)
     program.add_argument("--label").help("Specify volume label of boot partition or iso9660 image");
     program.add_argument("--no-data-partition").help("Use entire disk as boot partition").default_value(false).implicit_value(true);
     program.add_argument("--gpt").help("Always use GPT instead of MBR").default_value(false).implicit_value(true);
-    program.add_argument("--cdrom").help("Create iso9660 image").default_value(false).implicit_value(true);
+    program.add_argument("--cdrom").help("Create iso9660 image");
+    program.add_argument("--zip").help("Create zip-archived system directory");
     program.add_argument("--additional-boot-files").help("Zip-archived file contains additional boot files");
     program.add_argument("-y").help("Don't ask questions").default_value(false).implicit_value(true);
     program.add_argument("--debug").help("Show debug messages").default_value(false).implicit_value(true);
@@ -952,38 +1099,52 @@ int _main(int argc, char** argv)
     try {
         if (geteuid() != 0) throw std::runtime_error("You must be root");
 
-        if (program.present("--disk")) {
-            std::filesystem::path disk = program.get<std::string>("--disk");
+         auto [disk, cdrom, zip] = std::make_tuple(
+            program.present("--disk"),
+            program.present("--cdrom"), 
+            program.present("--zip")
+        );
+
+        if (!disk && !cdrom && !zip) {
+            std::filesystem::path system_image = program.get<std::string>("system_image");
+            return install_self(system_image, 
+                program.present("--system-cfg"),
+                program.present("--system-ini"));
+        }
+
+        //else
+        const auto& system_image = program.present("system_image").value_or(installed_system_image);
+
+        std::optional<std::filesystem::path> system_cfg = program.present("--system-cfg")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-cfg"))) : std::nullopt;
+        //std::cout << "System cfg: " << (system_cfg? system_cfg.value().string() : "not specified") << std::endl;
+        std::optional<std::filesystem::path> system_ini = program.present("--system-ini")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-ini"))) : std::nullopt;
+        //std::cout << "System ini: " << (system_ini? system_ini.value().string() : "not specified") << std::endl;
+        auto additional_boot_files = program.present("--additional-boot-files");
+
+        if (disk) {
             //std::cout << "Disk: " << disk << std::endl;
-            std::filesystem::path system_image = program.present("system_image")? std::filesystem::path(program.get<std::string>("system_image")) : installed_system_image;
-            //std::cout << "System image: " << system_image << std::endl;
-            std::optional<std::filesystem::path> system_cfg = program.present("--system-cfg")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-cfg"))) : std::nullopt;
-            //std::cout << "System cfg: " << (system_cfg? system_cfg.value().string() : "not specified") << std::endl;
-            std::optional<std::filesystem::path> system_ini = program.present("--system-ini")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-ini"))) : std::nullopt;
-            //std::cout << "System ini: " << (system_ini? system_ini.value().string() : "not specified") << std::endl;
-            std::optional<std::string> label = program.present("--label")? std::make_optional(program.get<std::string>("--label")) : std::nullopt;
-            //std::cout << "Label: " << (label? label.value() : "not specified") << std::endl;
-            std::optional<std::string> additional_boot_files = program.present("--additional-boot-files");
-            if (program.get<bool>("--cdrom")) {
-                return create_iso9660_image(disk, system_image, system_cfg, system_ini, label, additional_boot_files);
-            }
-            //else
-            return install_to_disk(disk, { 
+            auto rst = install_to_disk(disk.value(), { 
                 system_image: system_image, 
                 data_partition: !program.get<bool>("--no-data-partition"), 
                 system_cfg: system_cfg, 
                 system_ini:system_ini, 
-                label:label, 
+                label:program.present("--label"), 
                 additional_boot_files:additional_boot_files,
                 yes:program.get<bool>("-y"), 
                 gpt:program.get<bool>("--gpt"),
             });
+            if (rst != 0) return rst;
         }
-        // else 
-        std::filesystem::path system_image = program.get<std::string>("system_image");
-        return install_self(system_image, 
-            program.present("--system-cfg")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-cfg"))) : std::nullopt,
-            program.present("--system-ini")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-ini"))) : std::nullopt);
+        if (cdrom) {
+            auto rst = create_iso9660_image(cdrom.value(), system_image, system_cfg, system_ini, program.present("--label"), additional_boot_files);
+            if (rst != 0) return rst;
+        }
+        if (zip) {
+            auto rst = create_zip_archive(zip.value(), system_image, system_cfg, system_ini, additional_boot_files);
+            if (rst != 0) return rst;
+        }
+        return 0;
+
     }
     catch (const std::exception& ex) {
         std::cerr << ex.what() << std::endl;
