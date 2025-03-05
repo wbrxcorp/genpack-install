@@ -323,9 +323,6 @@ std::list<BlockDevice> lsblk(const std::optional<std::filesystem::path>& device 
     return devices;
 }
 
-const uint64_t MIN_DISK_SIZE = 4ULL * 1024 * 1024 * 1024;
-const uint64_t MIN_DISK_SIZE_TO_HAVE_DATA_PARTITION = 6ULL * 1024 * 1024 * 1024;
-
 std::string size_str(uint64_t size)
 {
     uint64_t gib = 1024L * 1024 * 1024;
@@ -350,7 +347,7 @@ int print_installable_disks()
             disks_to_be_excluded.insert(d.name);
             if (d.pkname) disks_to_be_excluded.insert(d.pkname.value());
         }
-        if (d.ro || d.size < MIN_DISK_SIZE || (d.type != "disk" && d.type != "loop")) {
+        if (d.ro || d.size < 4ULL * 1024 * 1024 * 1024/* at least 4GiB */ || (d.type != "disk" && d.type != "loop")) {
             disks_to_be_excluded.insert(d.name);
         }
     }
@@ -363,20 +360,21 @@ int print_installable_disks()
 }
 
 std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatibel*/> 
-    create_partitions(const BlockDevice& disk, bool data_partition = true, bool gpt = false)
+    create_partitions(const BlockDevice& disk, std::optional<size_t> boot_partition_size_in_gib = 4,
+        bool gpt = false)
 {
     auto disk_path = std::filesystem::path("/dev") / disk.name;
     std::vector<std::string> parted_args = {"--script", disk_path.string()};
     bool bios_compatible = !gpt && (disk.size <= 2199023255552L/*2TiB*/ && disk.log_sec == 512);
     parted_args.push_back(bios_compatible? "mklabel msdos" : "mklabel gpt");
-    if (data_partition) {
-        parted_args.push_back("mkpart primary fat32 1MiB 4GiB");
-        parted_args.push_back("mkpart primary btrfs 4GiB -1");
+    if (boot_partition_size_in_gib) {
+        parted_args.push_back("mkpart primary fat32 1MiB " + std::to_string(*boot_partition_size_in_gib) + "GiB");
+        parted_args.push_back("mkpart primary btrfs " + std::to_string(*boot_partition_size_in_gib) + "GiB -1");
     } else {
         parted_args.push_back("mkpart primary fat32 1MiB -1");
     }
     parted_args.push_back("set 1 boot on");
-    if (bios_compatible && data_partition) {
+    if (bios_compatible && boot_partition_size_in_gib) {
         parted_args.push_back("set 1 esp on");
     }
     if (exec("parted", parted_args) != 0) throw std::runtime_error("Creating partition failed");
@@ -428,7 +426,7 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
     if (!boot_partition_path) throw std::runtime_error("Unable to determine created boot partition");
 
     std::optional<std::filesystem::path> data_partition_path = std::nullopt;
-    if (data_partition) {
+    if (boot_partition_size_in_gib) {
         data_partition_path = get_partition(disk_path, 2);
     }
 
@@ -639,10 +637,13 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
     if (disk_info.ro) throw std::runtime_error(disk.string() + " is read-only device");
     if (has_mounted_partition) throw std::runtime_error(disk.string() + " has mounted partition");
     if (disk_info.pkname) throw std::runtime_error(disk.string() + " belongs to other block device");
-    if (disk_info.size < MIN_DISK_SIZE) throw std::runtime_error(disk.string() + " is too small(At least " + size_str(MIN_DISK_SIZE) + " required)");
+
+    auto system_image_size = std::filesystem::file_size(system_image);
+    auto boot_partition_size_in_gib = std::max<size_t>(4, (system_image_size * 3) / (1024 * 1024 * 1024) + 1);
+    if (disk_info.size < boot_partition_size_in_gib * 1024 * 1024 * 1024) throw std::runtime_error(disk.string() + " is too small(At least " + std::to_string(boot_partition_size_in_gib) + "GiB required)");
 
     auto data_partition = options.data_partition;
-    if (data_partition && disk_info.size < MIN_DISK_SIZE_TO_HAVE_DATA_PARTITION) {
+    if (data_partition && disk_info.size / (1024 * 1024 * 1024) < boot_partition_size_in_gib * 3 / 2) {
         std::cout << "Disk size is not large enough to have data partition.  Applying --no-data-partition." << std::endl;
         data_partition = false;
     }
@@ -664,7 +665,7 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
     std::cout << "Looks OK." << std::endl;
 
     std::cout << "Creating partitions..." << std::flush;
-    auto partitions = create_partitions(disk_info, data_partition, options.gpt);
+    auto partitions = create_partitions(disk_info, data_partition? std::make_optional(boot_partition_size_in_gib) : std::nullopt, options.gpt);
     std::cout << "Done." << std::endl;
 
     auto boot_partition_path = std::get<0>(partitions);
