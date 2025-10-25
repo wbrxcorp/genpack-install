@@ -447,6 +447,8 @@ int install_self(const std::filesystem::path& system_image, const SelfOptions& o
             std::cout << "Present system image is already preserved..." << std::flush;
         }
         std::filesystem::rename(new_system_image, system_image_to_replace);
+        sync();
+        std::cout << "New system image installed." << std::endl;
     }
     catch (const std::filesystem::filesystem_error& e) {
         if (!std::filesystem::exists(system_image_to_replace)) {
@@ -595,7 +597,7 @@ void print_installable_disks()
     std::cout << "Available disks:" << std::endl;
     for (const auto& d:lsblk_result) {
         if (disks_to_be_excluded.find(d.name) != disks_to_be_excluded.end()) continue;
-        std::cout << d.name << '\t' << d.model << '\t' << d.tran << '\t' << size_str(d.size) << std::endl;
+        std::cout << d.path.string() << '\t' << d.model << '\t' << d.tran << '\t' << size_str(d.size) << std::endl;
     }
 }
 
@@ -706,6 +708,8 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
             TempMount data_part_mount = TempMount("/tmp/genpack-install-", *data_partition_path, "btrfs", MS_RELATIME, "");
             std::filesystem::copy_file(system_image, data_part_mount / "system");
         }
+        // do sync
+        sync();
         std::cout << "Done" << std::endl;
 
         if (options.additional_boot_files) {
