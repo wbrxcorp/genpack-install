@@ -401,7 +401,7 @@ void install_boot_files(const std::filesystem::path& system_image, const std::fi
     }
 }
 
-int install_self(const std::filesystem::path& system_image, const SelfOptions& options = {})
+void install_self(const std::filesystem::path& system_image, const SelfOptions& options = {})
 {
     auto system_image_to_replace = get_installed_system_image_path();
     const std::filesystem::path& system_image_dir = [](const auto& system_image_to_replace) {
@@ -460,8 +460,6 @@ int install_self(const std::filesystem::path& system_image, const SelfOptions& o
         if (std::filesystem::exists(new_system_image)) std::filesystem::remove(new_system_image);
         throw e;
     }
-
-    return 1;
 }
 
 std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatibel*/> 
@@ -1010,12 +1008,13 @@ int main(int argc, char** argv)
 
         if (!disk && !cdrom && !zip) {
             std::filesystem::path system_image = program.get<std::string>("system_image");
-            return install_self(system_image, {
+            install_self(system_image, {
                 .system_config = {
                     .system_cfg = program.present("--system-cfg"),
                     .system_ini = program.present("--system-ini")
                 }
             });
+            return 0;
         }
 
         //else
