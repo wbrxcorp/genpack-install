@@ -4,3 +4,5 @@
 *.squashfs
 *.iso
 *.zip
+*.img
+*.efi

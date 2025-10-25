@@ -1,101 +1,83 @@
-#include <unistd.h>
-#include <string.h>
-#include <wait.h>
-#include <glob.h>
-#include <fcntl.h>
-#include <sys/mount.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
-#include <sys/mman.h>
 
-#include <libmount/libmount.h>
-#include <blkid/blkid.h>
+#include <unistd.h>
+#include <glob.h>
 
-#include <iostream>
 #include <fstream>
 #include <filesystem>
-#include <optional>
-#include <functional>
-#include <map>
-#include <set>
-#include <list>
+#include <cstring>
 #include <regex>
-#include <mutex>
+
 #include <ext/stdio_filebuf.h> // for __gnu_cxx::stdio_filebuf
+#include <libmount/libmount.h>
+#include <blkid/blkid.h>
 
 #include <argparse/argparse.hpp>
 #include <minizip/zip.h>
 
-static const std::filesystem::path boot_partition("/run/initramfs/boot");
-static const std::filesystem::path installed_system_image(boot_partition / "system.img");
-static const std::filesystem::path grub_lib = std::filesystem::path("/usr/lib/grub");
-
-static const auto efi_bootloaders = {
-    std::make_pair("x86_64-efi", "bootx64.efi"),
-    std::make_pair("i386-efi", "bootia32.efi"),
-    std::make_pair("arm64-efi", "bootaa64.efi")
-};
-
 static bool debug = false;
 
-static std::set<std::string> common_grub_modules = {
-    "loopback", "xfs", "btrfs", "fat", "exfat", "ntfscomp", "ext2",  "iso9660","lvm", "squash4",
-    "part_gpt", "part_msdos", "blocklist", 
-    "configfile", "linux", "chain", 
-    "echo",   "test", "probe",  "search",  "minicmd","sleep",
-    "all_video", "videotest", "serial", "png", "gfxterm_background", "videoinfo", "keystatus"
-};
+static const std::filesystem::path boot_partition("/run/initramfs/boot");
+static const std::filesystem::path data_partition("/run/initramfs/rw");
 
-static std::set<std::string> arch_specific_grub_modules = {
-    // DO NOT INCLUDE "ahci" HERE.  It makes booting regular PC impossible.
-    "ata", "biosdisk", "cpuid", "multiboot", "multiboot2", "fdt"
-};
+class TempMount {
+    std::filesystem::path tmpdir;
+public:
+    TempMount() = delete;
+    TempMount(const TempMount&) = delete;
+    TempMount& operator=(const TempMount&) = delete;
+    explicit TempMount(const std::string& prefix, const std::filesystem::path& device,
+        const std::string& fstype = "auto", int flags = MS_RELATIME, const std::string& data = ""){
+        char* tmpdir_rp = (char*)malloc(prefix.length() + 7);
+        if (!tmpdir_rp) throw std::runtime_error("malloc() failed");
+        strcpy(tmpdir_rp, prefix.c_str());
+        strcat(tmpdir_rp, "XXXXXX");
+        //else
+        auto rst = mkdtemp(tmpdir_rp);
+        if (!rst) {
+            free(tmpdir_rp);
+            throw std::runtime_error("mkdtemp() failed");
+        }
+        tmpdir = tmpdir_rp;
+        free(tmpdir_rp);
 
-bool is_dir(const std::filesystem::path& path)
-{
-    return std::filesystem::exists(path) && std::filesystem::is_directory(path);
-}
+        std::shared_ptr<libmnt_context> ctx(mnt_new_context(), mnt_free_context);
+        mnt_context_set_source(ctx.get(), device.c_str());
+        mnt_context_set_target(ctx.get(), tmpdir.c_str());
+        mnt_context_set_fstype(ctx.get(), fstype.c_str());
+        mnt_context_set_mflags(ctx.get(), flags);
+        mnt_context_set_options(ctx.get(), data.c_str());
 
-bool is_file(const std::filesystem::path& path)
-{
-    return std::filesystem::exists(path) && std::filesystem::is_regular_file(path);
-}
-
-const std::set<std::string> grub_modules(const std::string& platform)
-{
-    std::set<std::string> modules;
-    for (const auto& m:common_grub_modules) {
-        modules.insert(m);
-    }
-    
-    for (const auto& m:arch_specific_grub_modules) {
-        if (is_file(grub_lib / platform / (m + ".mod"))) {
-            modules.insert(m);
+        if (mnt_context_mount(ctx.get()) != 0) {
+            std::filesystem::remove(tmpdir);
+            throw std::runtime_error("mnt_context_mount() failed");
+        }
+        if (mnt_context_get_status(ctx.get()) != 1) {
+            std::filesystem::remove(tmpdir);
+            throw std::runtime_error("bad mount status");
         }
     }
-    if (debug) {
-        std::cout << "Grub modules for " << platform << ":" << std::endl;
-        for (const auto& m:modules) {
-            std::cout << m << std::endl;
+    ~TempMount() {
+        if (umount(tmpdir.c_str()) < 0) {
+            std::cerr << "Warning: umount(" << tmpdir.string() << ") failed: " << strerror(errno) << std::endl;
         }
+        std::filesystem::remove(tmpdir);
     }
-    return modules;
-}
-
-std::string bios_grub_modules_string(const std::set<std::string>& modules)
-{
-    std::string str;
-    for (const auto& m:modules) {
-        str += m + " ";
+    const std::filesystem::path& path() const {
+        return tmpdir;
     }
-    // remove last space
-    str.pop_back();
-    if (debug) {
-        std::cout << "Grub modules string:" << std::endl;
-        std::cout << str << std::endl;
+    operator std::filesystem::path() const {
+        return tmpdir;
     }
-    return str;
-}
+    std::filesystem::path operator/(const std::filesystem::path& other) const {
+        return tmpdir / other;
+    }
+    operator std::string() const {
+        return tmpdir.string();
+    }
+};
 
 int fork(std::function<int()> func)
 {
@@ -140,97 +122,8 @@ int exec(const std::string& cmd, const std::vector<std::string>& args)
     });
 }
 
-std::shared_ptr<char> create_tempmount(const std::string& prefix, const std::filesystem::path& device,
-    const std::string& fstype = "auto", int flags = MS_RELATIME, const std::string& data = "")
-{
-    char* tmpdir_rp = (char*)malloc(prefix.length() + 7);
-    if (!tmpdir_rp) throw std::runtime_error("malloc() failed");
-    strcpy(tmpdir_rp, prefix.c_str());
-    strcat(tmpdir_rp, "XXXXXX");
-    //else
-    auto rst = mkdtemp(tmpdir_rp);
-    if (!rst) {
-        free(tmpdir_rp);
-        throw std::runtime_error("mkdtemp() failed");
-    }
-    std::shared_ptr<char> tmpdir(rst, [](char* p) {
-        umount(p);
-        std::filesystem::remove(p);
-        free(p);
-    });
-
-    std::shared_ptr<libmnt_context> ctx(mnt_new_context(), mnt_free_context);
-    mnt_context_set_source(ctx.get(), device.c_str());
-    mnt_context_set_target(ctx.get(), tmpdir.get());
-    mnt_context_set_fstype(ctx.get(), fstype.c_str());
-    mnt_context_set_mflags(ctx.get(), flags);
-    mnt_context_set_options(ctx.get(), data.c_str());
-
-    if (mnt_context_mount(ctx.get()) != 0) throw std::runtime_error("mnt_context_mount() failed");
-    if (mnt_context_get_status(ctx.get()) != 1) throw std::runtime_error("bad mount status");
-
-    return tmpdir;
-}
-
-void check_system_image(const std::filesystem::path& system_image)
-{
-    auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
-    std::filesystem::path tempdir_path(tempdir.get());
-    const auto genpack_dir = tempdir_path / ".genpack";
-    if (!std::filesystem::is_directory(genpack_dir)) throw std::runtime_error("System image file doesn't contain .genpack directory");
-    if (!std::filesystem::exists(tempdir_path / "boot/bootcode.bin")) {
-        // kernel and initramfs is mandatory unless it's raspberry pi image
-        if (!std::filesystem::exists(tempdir_path / "boot/kernel")) throw std::runtime_error("System image file doesn't contain kernel image");
-        if (!std::filesystem::exists(tempdir_path / "boot/initramfs")) throw std::runtime_error("System image file doesn't contain initramfs");
-    }
-    //else
-    auto print_file = [&genpack_dir](const std::string& filename) {
-        std::ifstream i(genpack_dir / filename);
-        if (!i) return;
-        //else
-        std::string content;
-        i >> content;
-        std::cout << filename << ": " << content << std::endl;
-    };
-    print_file("profile");
-    print_file("artifact");
-}
-
-bool is_image_file_loopbacked(const std::filesystem::path& system_image)
-{
-    int fd[2];
-    if (pipe(fd) < 0) throw std::runtime_error("pipe() failed.");
-
-    pid_t pid = fork();
-    if (pid < 0) throw std::runtime_error("fork() failed.");
-
-    int rst;
-    bool is_loopbacked = false;
-    if (pid == 0) { //child
-        close(fd[0]);
-        dup2(fd[1], STDOUT_FILENO);
-        if (execlp("losetup", "losetup", "-j", system_image.c_str(), nullptr) < 0) _exit(-1);
-    } else { // parent
-      close(fd[1]);
-      {
-        __gnu_cxx::stdio_filebuf<char> filebuf(fd[0], std::ios::in);
-        std::istream f(&filebuf);
-        std::string line;
-        while (std::getline(f, line)) {
-            is_loopbacked = true;
-        }
-      }
-      close(fd[0]);
-    }
-
-    waitpid(pid, &rst, 0);
-
-    if (!WIFEXITED(rst) || WEXITSTATUS(rst) != 0) return false;
-
-    return is_loopbacked;
-}
-
 struct BlockDevice {
+    std::filesystem::path path;
     std::string name;
     std::string model;
     std::string type;
@@ -257,7 +150,7 @@ std::list<BlockDevice> lsblk(const std::optional<std::filesystem::path>& device 
     if (pid == 0) { //child
         close(fd[0]);
         dup2(fd[1], STDOUT_FILENO);
-        if (execlp("lsblk", "lsblk", "-bnr", "-o", "NAME,MODEL,TYPE,PKNAME,RO,MOUNTPOINT,SIZE,TRAN,LOG-SEC", device? device.value().c_str() : nullptr, nullptr) < 0) _exit(-1);
+        if (execlp("lsblk", "lsblk", "-bnr", "-o", "PATH,NAME,MODEL,TYPE,PKNAME,RO,MOUNTPOINT,SIZE,TRAN,LOG-SEC", device? device.value().c_str() : nullptr, nullptr) < 0) _exit(-1);
     } else { // parent
       close(fd[1]);
       try {
@@ -298,18 +191,20 @@ std::list<BlockDevice> lsblk(const std::optional<std::filesystem::path>& device 
                 splitted.push_back(unescape(line.substr(offset, pos - offset)));
                 offset = pos + 1;
             }
-            if (splitted.size() != 9) continue; // line is incomplete
+            if (splitted.size() != 10) continue; // line is incomplete
             devices.push_back(BlockDevice {
                 splitted[0],
                 splitted[1],
                 splitted[2],
-                splitted[3] != ""? std::make_optional(splitted[3]) : std::nullopt,
-                std::stoi(splitted[4]) > 0,
-                splitted[5] != ""? std::make_optional(splitted[5]) : std::nullopt,
-                std::stoull(splitted[6]),
-                splitted[7],
-                (uint16_t)std::stoi(splitted[8])
+                splitted[3],
+                splitted[4] != ""? std::make_optional(splitted[4]) : std::nullopt,
+                std::stoi(splitted[5]) > 0,
+                splitted[6] != ""? std::make_optional(splitted[6]) : std::nullopt,
+                std::stoull(splitted[7]),
+                splitted[8],
+                (uint16_t)std::stoi(splitted[9])
             });
+            //std::cout << "Debug: found device " << splitted[0] << std::endl;
         }
       }
       catch (const std::runtime_error& ex) { failed = true; }
@@ -338,33 +233,240 @@ std::string size_str(uint64_t size)
     return buf;
 }
 
-int print_installable_disks()
+uintmax_t get_freespace(const std::filesystem::path& path)
 {
-    auto lsblk_result = lsblk();
-    std::set<std::string> disks_to_be_excluded;
-    for (const auto& d:lsblk_result) {
-        if (d.mountpoint) {
-            disks_to_be_excluded.insert(d.name);
-            if (d.pkname) disks_to_be_excluded.insert(d.pkname.value());
-        }
-        if (d.ro || d.size < 4ULL * 1024 * 1024 * 1024/* at least 4GiB */ || (d.type != "disk" && d.type != "loop")) {
-            disks_to_be_excluded.insert(d.name);
-        }
+    std::error_code ec;
+    auto space_info = std::filesystem::space(path, ec);
+    if (ec) {
+        throw std::runtime_error("Failed to get free space of " + path.string() + ": " + ec.message());
     }
-    std::cout << "Available disks:" << std::endl;
-    for (const auto& d:lsblk_result) {
-        if (disks_to_be_excluded.find(d.name) != disks_to_be_excluded.end()) continue;
-        std::cout << "/dev/" << d.name << '\t' << d.model << '\t' << d.tran << '\t' << size_str(d.size) << std::endl;
+    return space_info.available;
+}
+
+void check_system_image(const std::filesystem::path& system_image)
+{
+    TempMount tempdir("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+    const auto genpack_dir = tempdir / ".genpack";
+    if (!std::filesystem::is_directory(genpack_dir)) throw std::runtime_error("System image file doesn't contain .genpack directory");
+    if (!std::filesystem::exists(tempdir / "boot/bootcode.bin")) {
+        // kernel and initramfs is mandatory unless it's raspberry pi image
+        if (!std::filesystem::exists(tempdir / "boot/kernel")) throw std::runtime_error("System image file doesn't contain kernel image");
+        if (!std::filesystem::exists(tempdir / "boot/initramfs")) throw std::runtime_error("System image file doesn't contain initramfs");
     }
-    return 0;
+    //else
+    auto print_file = [&genpack_dir](const std::string& filename) {
+        std::ifstream i(genpack_dir / filename);
+        if (!i) return;
+        //else
+        std::string content;
+        i >> content;
+        std::cout << filename << ": " << content << std::endl;
+    };
+    print_file("artifact");
+    print_file("variant");
+}
+
+std::filesystem::path get_installed_system_image_path()
+{
+    if (std::filesystem::is_regular_file(boot_partition / "system.img")) {
+        return boot_partition / "system.img";
+    }
+    //else
+    if (std::filesystem::is_regular_file(data_partition / "system")) {
+        return data_partition / "system";
+    }
+    throw std::runtime_error("No installed system image found.");
+}
+
+using OptionalSystemImage = std::optional<std::filesystem::path>;
+
+struct OptionalSystemConfig {
+    const std::optional<std::filesystem::path>& system_cfg{};
+    const std::optional<std::filesystem::path>& system_ini{};
+};
+
+using OptionalLabel = std::optional<std::string>;
+
+using OptionalAdditionalBootFiles = std::optional<std::string>;
+
+struct SelfOptions {
+    const OptionalSystemConfig& system_config{};
+};
+
+void install_bios_bootloader(const std::filesystem::path& boot_img, const std::filesystem::path& core_img,
+    const std::filesystem::path& grub_cfg,
+    const std::filesystem::path& boot_partition_path, const std::filesystem::path& disk)
+{
+    auto grub_dir = boot_partition_path / "boot/grub";
+    std::filesystem::create_directories(grub_dir);
+    std::filesystem::copy_file(boot_img, grub_dir / "boot.img", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(core_img, grub_dir / "core.img", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(grub_cfg, grub_dir / "grub.cfg", std::filesystem::copy_options::overwrite_existing);
+    if (exec("grub-bios-setup", {"-d", grub_dir.string(), disk.string()}) != 0) {
+        throw std::runtime_error("grub-bios-setup failed");
+    }
+    //else
+    std::filesystem::remove(grub_dir / "boot.img");
+    std::filesystem::remove(grub_dir / "core.img");
+}
+
+std::optional<std::filesystem::path> get_bootloader_path(const std::filesystem::path& system_image_root)
+{
+    auto path_in_system_image = system_image_root / "usr/lib/genpack-install";
+    if (std::filesystem::is_directory(path_in_system_image)) {
+        return path_in_system_image;
+    }
+    //else
+    if (std::filesystem::is_directory(std::filesystem::path("/usr/local/lib/genpack-install"))) {
+        return std::filesystem::path("/usr/local/lib/genpack-install");
+    }
+    //else
+    if (std::filesystem::is_directory(std::filesystem::path("/usr/lib/genpack-install"))) {
+        return std::filesystem::path("/usr/lib/genpack-install");
+    }
+    //else
+    return std::nullopt;
+}
+
+void install_boot_files(const std::filesystem::path& system_image, const std::filesystem::path& boot_partition_path,
+    const std::optional<std::filesystem::path>& disk = std::nullopt)
+{
+    TempMount system_image_root = TempMount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+
+    // raspi boot files
+    if (std::filesystem::exists(system_image_root / "boot/bootcode.bin")) {
+        std::cout << "Installing boot files for raspberry pi..." << std::endl;
+        // copy all files under system_image_root / "boot" to boot_partition_path
+        for (const auto& entry: std::filesystem::recursive_directory_iterator(system_image_root / "boot")) {
+            if (!entry.is_regular_file()) continue;
+            auto relative_path = std::filesystem::relative(entry.path(), system_image_root / "boot");
+            auto dest_path = boot_partition_path / relative_path;
+            // special treatment for cmdline.txt
+            if (relative_path == "cmdline.txt") {
+                if (std::filesystem::exists(dest_path)) {
+                    continue;
+                }
+                //else
+                std::ifstream f(entry.path());
+                std::string cmdline;
+                std::getline(f, cmdline);
+                // replace "ROOTDEV" to "systemimg:auto"
+                cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)root=[^ ]*)"), "$1root=systemimg:auto");
+                // remove "rootfstype=..."
+                cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)rootfstype=[^ ]*)"), "");
+                // write modified cmdline.txt to boot partition
+                std::ofstream out(boot_partition_path / relative_path);
+                out << cmdline << std::endl;
+                continue;
+            }
+            //else special treatment for config.txt
+            if (relative_path == "config.txt" && std::filesystem::exists(dest_path)) {
+                continue;
+            }
+            //else
+            std::filesystem::create_directories(dest_path.parent_path());
+            std::filesystem::copy_file(entry.path(), dest_path, std::filesystem::copy_options::overwrite_existing);
+        }
+        std::cout << "Done." << std::endl;
+    }
+
+    // bootloaders
+    auto bootloader_path = get_bootloader_path(system_image_root);
+
+    if (!bootloader_path) return;
+
+    // else
+    std::cout << "Installing EFI bootloaders..." << std::endl;
+    // copy all boot*.efi files right under bootloader_path to boot_partition_path / "efi/boot"
+    auto efi_boot_path = boot_partition_path / "efi/boot";
+    std::filesystem::create_directories(efi_boot_path);
+    for (const auto& entry: std::filesystem::directory_iterator(bootloader_path.value())) {
+        if (!entry.is_regular_file()) continue;
+        auto filename = entry.path().filename().string();
+        if (filename.size() < 5) continue;
+        if (filename.substr(0, 4) != "boot" || filename.substr(filename.size() - 4) != ".efi") continue;
+        std::filesystem::copy_file(entry.path(), efi_boot_path / filename, std::filesystem::copy_options::overwrite_existing);
+        std::cout << "  " << filename << " installed." << std::endl;
+    }
+    std::cout << "Done." << std::endl;
+
+    auto boot_img = *bootloader_path / "boot.img";
+    auto core_img = *bootloader_path / "core.img";
+    auto grub_cfg = *bootloader_path / "grub.cfg";
+    if (disk && std::filesystem::exists(boot_img) && std::filesystem::exists(core_img)
+        && std::filesystem::exists(grub_cfg) && system("grub-bios-setup --version > /dev/null 2>&1") == 0) {
+        std::cout << "Installing BIOS bootloader..." << std::endl;
+        install_bios_bootloader(boot_img, core_img, grub_cfg, boot_partition_path, *disk);
+        std::cout << "Done." << std::endl;
+    }
+}
+
+int install_self(const std::filesystem::path& system_image, const SelfOptions& options = {})
+{
+    auto system_image_to_replace = get_installed_system_image_path();
+    const std::filesystem::path& system_image_dir = [](const auto& system_image_to_replace) {
+        const auto& dir = system_image_to_replace.parent_path();
+        if (dir == boot_partition) {
+            return boot_partition;
+        } else if (dir == data_partition) {
+            return data_partition;
+        } else {
+            throw std::runtime_error("Installed system image is in unknown location.");
+        }
+    }(system_image_to_replace);
+    auto system_image_size = std::filesystem::file_size(system_image);
+    //else
+    if (system_image_size >= 4 * 1024 * 1024 * 1024ULL && system_image_dir == boot_partition) {
+        throw std::runtime_error("Cannot install system image larger than or equal to 4GiB to boot partition.");
+    }
+    //else
+    check_system_image(system_image);
+
+    install_boot_files(system_image, boot_partition);
+
+    const std::filesystem::path replaced_system_image = system_image_dir / "system.cur";
+    const std::filesystem::path new_system_image = system_image_dir / "system.new";
+    const std::filesystem::path old_system_image = system_image_dir / "system.old";
+
+    if (std::filesystem::exists(old_system_image)) {
+        std::filesystem::remove(old_system_image);
+        std::cout << "Old system image removed to preserve disk space." << std::endl;
+    }
+
+    if (get_freespace(system_image_dir) < system_image_size) {
+        throw std::runtime_error("Not enough free space to install new system image.");
+    }
+
+    std::cout << "Copying new system image..." << std::flush;
+    try {
+        std::filesystem::copy_file(system_image, new_system_image);
+        if (!std::filesystem::exists(replaced_system_image)) {
+            std::filesystem::rename(system_image_to_replace, replaced_system_image);
+            std::cout << "Present system image preserved..." << std::flush;
+        } else {
+            std::cout << "Present system image is already preserved..." << std::flush;
+        }
+        std::filesystem::rename(new_system_image, system_image_to_replace);
+    }
+    catch (const std::filesystem::filesystem_error& e) {
+        if (!std::filesystem::exists(system_image_to_replace)) {
+            if (std::filesystem::exists(replaced_system_image)) {
+                std::filesystem::rename(replaced_system_image, system_image_to_replace);
+                std::cout << "Original system image restored." << std::endl;
+            }
+        }
+        if (std::filesystem::exists(new_system_image)) std::filesystem::remove(new_system_image);
+        throw e;
+    }
+
+    return 1;
 }
 
 std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatibel*/> 
     create_partitions(const BlockDevice& disk, std::optional<size_t> boot_partition_size_in_gib = 4,
         bool gpt = false)
 {
-    auto disk_path = std::filesystem::path("/dev") / disk.name;
-    std::vector<std::string> parted_args = {"--script", disk_path.string()};
+    std::vector<std::string> parted_args = {"--script", disk.path.string()};
     bool bios_compatible = !gpt && (disk.size <= 2199023255552L/*2TiB*/ && disk.log_sec == 512);
     parted_args.push_back(bios_compatible? "mklabel msdos" : "mklabel gpt");
     if (boot_partition_size_in_gib) {
@@ -422,12 +524,12 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
         return std::nullopt;
     };
 
-    auto boot_partition_path = get_partition(disk_path, 1);
+    auto boot_partition_path = get_partition(disk.path, 1);
     if (!boot_partition_path) throw std::runtime_error("Unable to determine created boot partition");
 
     std::optional<std::filesystem::path> data_partition_path = std::nullopt;
     if (boot_partition_size_in_gib) {
-        data_partition_path = get_partition(disk_path, 2);
+        data_partition_path = get_partition(disk.path, 2);
     }
 
     return std::make_tuple(boot_partition_path.value(), data_partition_path, bios_compatible);
@@ -468,159 +570,57 @@ void copy_system_cfg_ini(const std::optional<std::filesystem::path>& system_cfg,
     const std::filesystem::path& dest)
 {
     if (system_cfg) {
-        if (!is_file(system_cfg.value())) throw std::runtime_error(system_cfg.value().string() + " does not exist or not a regular file");
+        if (!std::filesystem::is_regular_file(*system_cfg)) throw std::runtime_error(system_cfg.value().string() + " does not exist or not a regular file");
         std::filesystem::copy_file(system_cfg.value(), dest / "system.cfg");
     }
     if (system_ini) {
-        if (!is_file(system_ini.value())) throw std::runtime_error(system_ini.value().string() + " does not exist or not a regular file");
+        if (!std::filesystem::is_regular_file(*system_ini)) throw std::runtime_error(system_ini.value().string() + " does not exist or not a regular file");
         std::filesystem::copy_file(system_ini.value(), dest / "system.ini");
     }
 }
 
-template <typename T> T with_memfd(const std::string& name, unsigned int flags, std::function<T(const std::filesystem::path&)> func)
+void print_installable_disks()
 {
-    int fd = memfd_create(name.c_str(), flags);
-    if (fd < 0) throw std::runtime_error("memfd_create() failed.");
-    auto rst = func(std::filesystem::path("/proc") / std::to_string(getpid()) / "fd" / std::to_string(fd));
-    close(fd);
-    return rst;
+    auto lsblk_result = lsblk();
+    std::set<std::string> disks_to_be_excluded;
+    for (const auto& d:lsblk_result) {
+        if (d.mountpoint) {
+            disks_to_be_excluded.insert(d.name);
+            if (d.pkname) disks_to_be_excluded.insert(*d.pkname);
+        }
+        if (d.ro || d.size < 4ULL * 1024 * 1024 * 1024/* at least 4GiB */ || (d.type != "disk" && d.type != "loop")) {
+            disks_to_be_excluded.insert(d.name);
+        }
+    }
+    std::cout << "Available disks:" << std::endl;
+    for (const auto& d:lsblk_result) {
+        if (disks_to_be_excluded.find(d.name) != disks_to_be_excluded.end()) continue;
+        std::cout << d.name << '\t' << d.model << '\t' << d.tran << '\t' << size_str(d.size) << std::endl;
+    }
 }
 
-bool generate_efi_bootloader(const std::string& arch, const std::filesystem::path& output)
-{
-    // create output directory if not exist
-    std::filesystem::create_directories(output.parent_path());
 
-    return with_memfd<bool>("grub.cfg", 0, [&arch,&output](const auto& grub_cfg) {
-        {
-            std::ofstream cfgfile(grub_cfg);
-            if (!cfgfile) {
-                std::cout << "Writing grub.cfg on memfd failed." << std::endl;
-                return false;
-            }
-            //else
-            cfgfile << "set BOOT_PARTITION=$root\n"
-                << "loopback loop /system.img\n"
-                << "set root=loop\n"
-                << "set prefix=($root)/boot/grub\n"
-                << std::endl;
-        }
-
-        std::vector<std::string> args = {"-p", "/boot/grub", 
-            "-c", grub_cfg.string(),
-            "-o", output.string(), "-O", arch};
-        if (debug) args.push_back("--verbose");
-        const auto grub_modules = ::grub_modules(arch);
-        args.insert(args.end(), grub_modules.begin(), grub_modules.end());
-        if (debug) {
-            std::cout << "grub-mkimage(EFI) args:" << std::endl;
-            for (const auto& arg:args) {
-                std::cout << arg << std::endl;
-            }
-        }
-        auto rst = (exec("grub-mkimage", args) == 0);
-        if (exec("grub-mkimage", args) != 0) {
-            std::cout << "grub-mkimage(EFI) failed." << std::endl;
-            return false;
-        }
-        // else
-        return true;
-    });
-}
-
-bool install_bios_bootloader(const std::filesystem::path& disk, const std::filesystem::path& boot_partition_dir)
-{
-    if (exec("grub-install", {"--target=i386-pc", "--recheck", 
-        std::string("--boot-directory=") + (boot_partition_dir / "boot").string(),
-        "--modules=" + bios_grub_modules_string(grub_modules("i386-pc")),
-        disk.string()}) != 0) return false;
-    // create boot config file
-    auto grub_dir = boot_partition_dir / "boot/grub";
-    std::filesystem::create_directories(grub_dir);
-    {
-        std::ofstream grubcfg(grub_dir / "grub.cfg");
-        if (grubcfg) {
-            grubcfg << "insmod echo\ninsmod linux\ninsmod serial\n"
-                << "set BOOT_PARTITION=$root\n"
-                << "loopback loop /system.img\n"
-                << "set root=loop\nset prefix=($root)/boot/grub\nnormal"
-                << std::endl;
-        } else {
-            std::cout << "Writing grub.cfg failed." << std::endl;
-            return false;
-        }
-    }
-    return true;
-}
-
-bool install_bootloader(const std::filesystem::path& system_image, const std::filesystem::path& disk, 
-    const std::filesystem::path& boot_partition_dir, const std::string& boot_partition_uuid, bool bios_compatible = true)
-{
-    auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
-    std::filesystem::path tempdir_path(tempdir.get());
-
-    if (std::filesystem::exists(tempdir_path / "boot/bootcode.bin")) {
-        // raspberry pi
-        std::cout << "Installing boot files for raspberry pi..." << std::endl;
-        if (exec("cp", {"-a", (tempdir_path / "boot" / ".").string() , boot_partition_dir}) != 0) {
-            std::cerr << "Failed to copy boot files." << std::endl;
-            return false;
-        }
-        if (exec("sed", {"-i", "s/ROOTDEV/systemimg:" + boot_partition_uuid + "/", boot_partition_dir / "cmdline.txt"}) != 0) {
-            std::cerr << "Failed to modify cmdline.txt." << std::endl;
-            return false;
-        }
-        exec("sed", {"-i", "s/rootfstype=[^ ]* //", boot_partition_dir / "cmdline.txt"});
-        std::cout << "Done." << std::endl;
-        return true;
-    }
-
-    //else
-
-    bool some_bootloader_installed = false;
-    auto efi_boot = boot_partition_dir / "efi/boot";
-    auto grub_lib = std::filesystem::path("/usr/lib/grub");
-    for (const auto& [arch, filename]:efi_bootloaders) {
-        if (is_dir(grub_lib / arch) && generate_efi_bootloader(arch, efi_boot / filename)) {
-            std::cout << arch << " bootloader installed." << std::endl;
-            some_bootloader_installed = true;
-        }
-    }
-
-    if (bios_compatible && is_dir(grub_lib / "i386-pc") && install_bios_bootloader(disk, boot_partition_dir)) {
-        std::cout << "i386-pc bootloader installed." << std::endl;
-        some_bootloader_installed = true;
-    }
-
-    if (!some_bootloader_installed) {
-        std::cerr << "No bootloader installed." << std::endl;
-    }
-    return some_bootloader_installed;
-}
-
-struct InstallOptions {
-    const std::optional<std::filesystem::path>& system_image = installed_system_image;
-    const bool data_partition = true;
-    const std::optional<std::filesystem::path>& system_cfg = std::nullopt;
-    const std::optional<std::filesystem::path>& system_ini = std::nullopt;
-    const std::optional<std::string>& label = std::nullopt;
-    const std::optional<std::string>& additional_boot_files = std::nullopt;
-    const bool yes = false;
-    const bool gpt = false;
+struct DiskOptions {
+    const OptionalSystemImage& system_image{};
+    const OptionalSystemConfig& system_config{};
+    const OptionalLabel& label{};
+    const OptionalAdditionalBootFiles& additional_boot_files{};
+    const bool data_partition{};
+    const bool prefer_gpt{};
+    const bool yes{};
 };
 
-int install_to_disk(const std::filesystem::path& disk, InstallOptions options = {})
+void install_to_disk(const std::filesystem::path& disk, const DiskOptions& options = {})
 {
-    if (disk == "list") return print_installable_disks();
-
-    //else
-    auto system_image = options.system_image.value_or(installed_system_image);
-    if (!options.system_image) {
-        std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
-    }
+    auto system_image = [](const auto& system_image) {
+        if (system_image) return *system_image;
+        //else
+        auto actual_system_image = get_installed_system_image_path();
+        std::cerr << "System file image not specified. assuming " << actual_system_image << "." << std::endl;
+        return actual_system_image;
+    }(options.system_image);
 
     if (!std::filesystem::exists(system_image)) throw std::runtime_error("System image file " + system_image.string() + " does not exist.");
-
     if (!std::filesystem::exists(disk)) throw std::runtime_error("No such device");
 
     auto lsblk_result = lsblk(disk);
@@ -631,22 +631,28 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
         if (d.mountpoint) has_mounted_partition = true;
     }
 
-    auto disk_info = *lsblk_result.begin();
-
+    auto disk_info = *lsblk_result.begin(); // the first one is the disk itself
     if (disk_info.type != "disk" && disk_info.type != "loop") throw std::runtime_error(disk.string() + " is not a disk");
     if (disk_info.ro) throw std::runtime_error(disk.string() + " is read-only device");
     if (has_mounted_partition) throw std::runtime_error(disk.string() + " has mounted partition");
     if (disk_info.pkname) throw std::runtime_error(disk.string() + " belongs to other block device");
-
+    //else
     auto system_image_size = std::filesystem::file_size(system_image);
-    auto boot_partition_size_in_gib = std::max<size_t>(4, (system_image_size * 3) / (1024 * 1024 * 1024) + 1);
-    if (disk_info.size < boot_partition_size_in_gib * 1024 * 1024 * 1024) throw std::runtime_error(disk.string() + " is too small(At least " + std::to_string(boot_partition_size_in_gib) + "GiB required)");
+    auto least_capacity_needed_in_gib = std::max<size_t>(4, (system_image_size * 3) / (1024 * 1024 * 1024ULL) + 1);
+    if (disk_info.size < least_capacity_needed_in_gib * 1024 * 1024 * 1024ULL) throw std::runtime_error(disk.string() + " is too small(At least " + std::to_string(least_capacity_needed_in_gib) + "GiB required)");
+    //else
+    bool system_image_fits_boot_partition = system_image_size < 4 * 1024 * 1024 * 1024ULL;
 
     auto data_partition = options.data_partition;
-    if (data_partition && disk_info.size / (1024 * 1024 * 1024) < boot_partition_size_in_gib * 3 / 2) {
+    if (data_partition && disk_info.size / (1024 * 1024 * 1024) < least_capacity_needed_in_gib * 3 / 2) {
         std::cout << "Disk size is not large enough to have data partition.  Applying --no-data-partition." << std::endl;
         data_partition = false;
     }
+    if (!system_image_fits_boot_partition && !data_partition) {
+        throw std::runtime_error("Cannot install system image larger than or equal to 4GiB to boot partition.");
+    }
+    //else
+    auto boot_partition_size_in_gib = system_image_fits_boot_partition? least_capacity_needed_in_gib : 1; // 1 GiB boot partition for large system image with data partition
 
     std::cout << "Device path: " << disk << std::endl;
     std::cout << "Disk model: " << disk_info.model << std::endl;
@@ -657,7 +663,8 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
         std::string sure;
         std::cout << "All data present on " << disk << " will be lost. Are you sure? (y/n):" << std::flush;
         std::cin >> sure;
-        if (sure != "y" && sure != "yes" && sure != "Y") return 1;
+        if (sure != "y" && sure != "yes" && sure != "Y") 
+            throw std::runtime_error("User aborted installation");
     }
 
     std::cout << "Checking system image file..." << std::endl;
@@ -665,7 +672,7 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
     std::cout << "Looks OK." << std::endl;
 
     std::cout << "Creating partitions..." << std::flush;
-    auto partitions = create_partitions(disk_info, data_partition? std::make_optional(boot_partition_size_in_gib) : std::nullopt, options.gpt);
+    auto partitions = create_partitions(disk_info, data_partition? std::make_optional(boot_partition_size_in_gib) : std::nullopt, options.prefer_gpt);
     std::cout << "Done." << std::endl;
 
     auto boot_partition_path = std::get<0>(partitions);
@@ -682,120 +689,128 @@ int install_to_disk(const std::filesystem::path& disk, InstallOptions options = 
 
     {
         std::cout << "Mounting boot partition..." << std::flush;
-        auto tempdir = create_tempmount("/tmp/genpack-install-", boot_partition_path, "vfat", MS_RELATIME, "fmask=177,dmask=077");
-        std::cout << "Done" << std::endl;
-        auto tempdir_path = std::filesystem::path(tempdir.get());
+        auto tempdir = TempMount("/tmp/genpack-install-", boot_partition_path, "vfat", MS_RELATIME, "fmask=177,dmask=077");
+        std::cout << "Done." << std::endl;
 
-        std::cout << "Installing bootloader..." << std::flush;
-        if (!install_bootloader(system_image, disk, tempdir_path, boot_partition_uuid, bios_compatible)) {
-            std::cout << "Failed" << std::endl;
-            return 1;
-        }
-        //else
-        std::cout << "Done" << std::endl;
-        if (options.system_cfg || options.system_ini) {
+        install_boot_files(system_image, tempdir, bios_compatible? std::make_optional(disk) : std::nullopt);
+
+        if (options.system_config.system_cfg || options.system_config.system_ini) {
             std::cout << "Copying system config file..." << std::flush;
-            copy_system_cfg_ini(options.system_cfg, options.system_ini, tempdir_path);
+            copy_system_cfg_ini(options.system_config.system_cfg, options.system_config.system_ini, tempdir);
             std::cout << "Done" << std::endl;
         }
         std::cout << "Copying system image file..." << std::flush;
-        std::filesystem::copy_file(system_image, tempdir_path / "system.img");
+        if (system_image_fits_boot_partition) {
+            std::filesystem::copy_file(system_image, tempdir / "system.img");
+        } else {
+            TempMount data_part_mount = TempMount("/tmp/genpack-install-", *data_partition_path, "btrfs", MS_RELATIME, "");
+            std::filesystem::copy_file(system_image, data_part_mount / "system");
+        }
+        std::cout << "Done" << std::endl;
 
         if (options.additional_boot_files) {
             std::cout << "Extracting additional boot files..." << std::flush;
             // extract zip archive
-            if (exec("unzip", {*options.additional_boot_files, "-d", tempdir_path.string()}) != 0) {
+            if (exec("unzip", {*options.additional_boot_files, "-d", tempdir}) != 0) {
                 std::cout << "Failed" << std::endl;
-                return 1;
+                throw std::runtime_error("Failed to extract additional boot files.");
             }
             std::cout << "Done" << std::endl;
         }
     }
-    std::cout << "Done." << std::endl;
-
-    return 0;
+    std::cout << "Installation completed successfully." << std::endl;
 }
 
-int create_iso9660_image(const std::filesystem::path& image, const std::optional<std::filesystem::path>& _system_image,
-    const std::optional<std::filesystem::path>& system_cfg = std::nullopt, const std::optional<std::filesystem::path>& system_ini = std::nullopt,
-    const std::optional<std::string>& label = std::nullopt, const std::optional<std::string>& additional_boot_files = std::nullopt)
-{
-    if (exec("xorriso", {"-version"}) != 0) {
-        std::cerr << "`xorriso -version` failed. Probably xorriso(libisoburn) is not installed." << std::endl;
-        return 1;
-    }
+struct ISO9660Options {
+    const OptionalSystemImage& system_image{};
+    const OptionalSystemConfig& system_config{};
+    const OptionalLabel& label{};
+};
 
-    const auto& system_image = _system_image.value_or(installed_system_image);
-    if (!_system_image) {
-        std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
+void create_iso9660_image(const std::filesystem::path& output_image, const ISO9660Options& options = {})
+{
+    if (system("xorriso -version > /dev/null 2>&1") != 0) {
+        throw std::runtime_error("`xorriso -version` failed. Probably xorriso(libisoburn) is not installed.");
     }
+    //else
+    auto system_image = [](const auto& system_image) {
+        if (system_image) return *system_image;
+        //else
+        auto actual_system_image = get_installed_system_image_path();
+        std::cerr << "System file image not specified. assuming " << actual_system_image << "." << std::endl;
+        return actual_system_image;
+    }(options.system_image);
 
     if (!std::filesystem::exists(system_image)) throw std::runtime_error("System image file " + system_image.string() + " does not exist.");
-    if (std::filesystem::exists(image) && !std::filesystem::is_regular_file(image))
-        throw std::runtime_error(image.string() + " cannot be overwritten");
+    if (std::filesystem::exists(output_image) && !std::filesystem::is_regular_file(output_image))
+        throw std::runtime_error(output_image.string() + " cannot be overwritten");
 
-    auto tempdir = create_tempmount("/tmp/genpack-iso9660-", "tmpfs", "tmpfs");
-    auto tempdir_path = std::filesystem::path(tempdir.get());
-    auto grubcfg_path = tempdir_path / "grub.cfg";
-    { 
-        std::ofstream grubcfg(grubcfg_path);
-        grubcfg << "set BOOT_PARTITION=$root\n"
-        << "loopback loop /system.img\n"
-        << "set root=loop\n"
-        << "set prefix=($root)/boot/grub" << std::endl;
-    }
-    std::filesystem::create_directory(tempdir_path / "boot");
-    auto boot_img = tempdir_path / "boot" / "boot.img";
+    check_system_image(system_image);
+    TempMount system_image_root = TempMount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
 
-    std::vector<std::string> bios_grub_cmdline = {
-        "-p", "/boot/grub", "-c", grubcfg_path.string(), "-o", boot_img.string(), "-O", "i386-pc-eltorito"
-    };
-    const auto bios_grub_modules = ::grub_modules("i386-pc");
-    bios_grub_cmdline.insert(bios_grub_cmdline.end(), bios_grub_modules.begin(), bios_grub_modules.end());
-
-    if (exec("grub-mkimage", bios_grub_cmdline) != 0) throw std::runtime_error("grub-mkimage(BIOS) failed");
-
-    auto efi_boot_dir = tempdir_path / "efi/boot";
-    std::filesystem::create_directories(efi_boot_dir);
-    auto bootx64_efi = efi_boot_dir / "bootx64.efi";
-    std::vector<std::string> efi_grub_cmdline = {
-        "-p", "/boot/grub", "-c", grubcfg_path.string(), "-o", bootx64_efi.string(), "-O", "x86_64-efi"
-    };
-    const auto efi_grub_modules = ::grub_modules("x86_64-efi");
-    efi_grub_cmdline.insert(efi_grub_cmdline.end(), efi_grub_modules.begin(), efi_grub_modules.end());
-    if (exec("grub-mkimage", efi_grub_cmdline) != 0) throw std::runtime_error("grub-mkimage(EFI) failed");
-
-    std::filesystem::remove(grubcfg_path);
-
-    auto efiboot_img = tempdir_path / "boot" / "efiboot.img";
-    // create zero filled 1.44MB file (4096 * 360)
-    int fd = creat(efiboot_img.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (fd < 0) throw std::runtime_error("creat() failed");
-    int rst = ftruncate(fd, 4096 * 360);
-    close(fd);
-    if (rst < 0) throw std::runtime_error("ftruncate() failed");
-    if (exec("mkfs.vfat", { "-F", "12", "-M", "0xf8", efiboot_img.string() }) != 0) throw std::runtime_error("mkfs.vfat failed");
-    if (exec("mmd", {"-i", efiboot_img.string(), "/efi", "/efi/boot"}) != 0) throw std::runtime_error("mmd(mtools) failed");
-    if (exec("mcopy", {"-i", efiboot_img.string(), bootx64_efi.string(), "::/efi/boot/"}) != 0) throw std::runtime_error("mcopy(mtools) failed");
-
-    copy_system_cfg_ini(system_cfg, system_ini, tempdir_path);
-    if (additional_boot_files) {
-        if (exec("unzip", {*additional_boot_files, "-d", tempdir_path.string()}) != 0) {
-            throw std::runtime_error("Extracting additional boot files failed");
-        }
+    auto bootloader_path = get_bootloader_path(system_image_root);
+    if (!bootloader_path) {
+        throw std::runtime_error("No bootloader files found.");
     }
 
-    return exec("xorriso", {
-        "-as", "mkisofs", "-f", "-J", "-r", "-no-emul-boot",
-        "-boot-load-size", "4", "-boot-info-table", "-graft-points",
-        "-b", "boot/boot.img",
-        "-eltorito-alt-boot",
-        "-append_partition", "2", "0xef", efiboot_img.string()/*"boot/efiboot.img"*/,
-        "-e", "--interval:appended_partition_2:all::",
-        "-no-emul-boot", "-isohybrid-gpt-basdat",
-        "-V", label.value_or("GENPACK-BOOTCD"), "-o", image.string(), tempdir_path.string(),
-        "system.img=" + system_image.string()});
+    std::vector<std::string> xorriso_cmdline = {
+        "-outdev", output_image, "-rockridge", "on", "-joliet", "on",
+        "-map", (*bootloader_path / "grub.cfg").string(), "/boot/grub/grub.cfg",
+        "-map", system_image.string(), "/system.img",
+        "-volid", options.label ? *options.label : "GENPACK",
+    };
+
+    bool bios = std::filesystem::exists(*bootloader_path / "eltorito-bios.img");
+    bool efi = std::filesystem::exists(*bootloader_path / "eltorito-efi.img");
+
+    if (bios) {
+        xorriso_cmdline.insert(xorriso_cmdline.end(), {
+            "-map", (*bootloader_path / "eltorito-bios.img").string(), "/boot/grub/i386-pc/eltorito.img",
+        });
+    }
+    if (efi) {
+        xorriso_cmdline.insert(xorriso_cmdline.end(), {
+            "-append_partition", "2", "0xef", (*bootloader_path / "eltorito-efi.img").string(),
+        });
+    }
+    xorriso_cmdline.insert(xorriso_cmdline.end(), {
+        "-boot_image", "any", "boot_info_table=on",
+    });
+
+    if (bios) {
+        xorriso_cmdline.insert(xorriso_cmdline.end(), {
+            "-boot_image", "grub", "bin_path=/boot/grub/i386-pc/eltorito.img",
+            "-boot_image", "grub", "load_size=full",
+        });
+    }
+    if (bios && efi) {
+        xorriso_cmdline.insert(xorriso_cmdline.end(), {
+            "-boot_image", "any", "next",
+        });
+    }
+    if (efi) {
+        xorriso_cmdline.insert(xorriso_cmdline.end(), {
+            "-boot_image", "any", "efi_path=--interval:appended_partition_2:all::",
+            "-boot_image", "any", "platform_id=0xef",
+        });
+    }
+    xorriso_cmdline.push_back("-commit");
+
+    std::cout << "Creating ISO9660 image..." << std::endl;
+    if (std::filesystem::exists(output_image)) {
+        std::filesystem::remove(output_image);
+    }
+    if (exec("xorriso", xorriso_cmdline) != 0) {
+        throw std::runtime_error("Failed to create ISO9660 image.");
+    }
+    std::cout << "Done." << std::endl;
 }
+
+struct ZipOptions {
+    const OptionalSystemImage& system_image{};
+    const OptionalSystemConfig& system_config{};
+    const OptionalAdditionalBootFiles& additional_boot_files{};
+};
 
 size_t add_file_to_zip(zipFile zf, const std::filesystem::path& file, const std::string& zip_path)
 {
@@ -871,191 +886,68 @@ size_t add_text_to_zip(zipFile zf, const std::string& text, const std::string& z
     return text.size();
 }
 
-int create_zip_archive(const std::filesystem::path& archive, 
-    const std::optional<std::filesystem::path>& _system_image = std::nullopt,
-    const std::optional<std::filesystem::path>& system_cfg = std::nullopt, 
-    const std::optional<std::filesystem::path>& system_ini = std::nullopt,
-    const std::optional<std::string>& additional_boot_files = std::nullopt)
+void create_zip_archive(const std::filesystem::path& output_zip, const ZipOptions& options = {})
 {
-    const auto& system_image = _system_image.value_or(installed_system_image);
-    if (!_system_image) {
-        std::cerr << "System file image not specified. assuming " << system_image << "." << std::endl;
-    }
-
-    auto zf = zipOpen(archive.c_str(), APPEND_STATUS_CREATE);
+    auto system_image = [](const auto& system_image) {
+        if (system_image) return *system_image;
+        //else
+        auto actual_system_image = get_installed_system_image_path();
+        std::cerr << "System file image not specified. assuming " << actual_system_image << "." << std::endl;
+        return actual_system_image;
+    }(options.system_image);
+    
+    auto zf = zipOpen(output_zip.c_str(), APPEND_STATUS_CREATE);
     if (!zf) throw std::runtime_error("zipOpen() failed");
     //else
     add_file_to_zip(zf, system_image, "system.img");
-    if (system_cfg) add_file_to_zip(zf, system_cfg.value(), "system.cfg");
-    if (system_ini) add_file_to_zip(zf, system_ini.value(), "system.ini");
+    if (options.system_config.system_cfg) add_file_to_zip(zf, *options.system_config.system_cfg, "system.cfg");
+    if (options.system_config.system_ini) add_file_to_zip(zf, *options.system_config.system_ini, "system.ini");
 
-    // generate bootloader
-    for (const auto& [arch, filename]:efi_bootloaders) {
-        if (is_dir(grub_lib / arch)) {
-            // create tempfile by memfd_create
-            auto rst = with_memfd<bool>("grub.efi", 0, [zf,arch,filename](const auto& tmpfile) {
-                if (generate_efi_bootloader(arch, tmpfile)) {
-                    add_file_to_zip(zf, tmpfile, std::string("efi/boot/") + filename);
-                    return true;
-                }
-                //else
-                return false;
-            });
-            if (rst) {
-                std::cout << arch << " bootloader generated." << std::endl;
-            }
-        }
+    check_system_image(system_image);
+    TempMount system_image_root = TempMount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
+    auto bootloader_path = get_bootloader_path(system_image_root);
+    if (bootloader_path) {
+        // add efi bootloaders
+
     }
 
-    {
-        // for raspberry pi, all files under /boot should be copied to boot partition
-        auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
-        auto tempdir_path = std::filesystem::path(tempdir.get());
-        if (is_file(tempdir_path / "boot" / "bootcode.bin")) {
-            // raspberry pi
-            std::cout << "Installing boot files for raspberry pi..." << std::endl;
-            // zip all files under tmpdir_path / "boot" recursively
-            auto tempdir_path_boot = tempdir_path / "boot";
-            for (const auto& entry: std::filesystem::recursive_directory_iterator(tempdir_path_boot)) {
-                if (!entry.is_regular_file()) continue;
-                auto relative_path = std::filesystem::relative(entry.path(), tempdir_path_boot).string();
-                if (relative_path == "cmdline.txt") {
-                    // modify cmdline.txt
-                    std::ifstream f(entry.path());
-                    std::string cmdline;
-                    std::getline(f, cmdline);
-                    // replace "ROOTDEV" to "systemimg:auto"
-                    cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)root=[^ ]*)"), "$1root=systemimg:auto");
-                    // remove "rootfstype=..."
-                    cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)rootfstype=[^ ]*)"), "");
-                    // write modified cmdline.txt to zip
-                    add_text_to_zip(zf, cmdline, relative_path);
-                    continue;
-                }
-                // else 
-                add_file_to_zip(zf, entry.path(), std::filesystem::relative(entry.path(), tempdir_path_boot).string());
+    // special treatment for raspberry pi
+    if (std::filesystem::is_regular_file(system_image_root / "boot/bootcode.bin")) {
+        // raspberry pi
+        std::cout << "Installing boot files for raspberry pi..." << std::endl;
+        // zip all files under tmpdir_path / "boot" recursively
+        auto tempdir_path_boot = system_image_root / "boot";
+        for (const auto& entry: std::filesystem::recursive_directory_iterator(tempdir_path_boot)) {
+            if (!entry.is_regular_file()) continue;
+            auto relative_path = std::filesystem::relative(entry.path(), tempdir_path_boot).string();
+            if (relative_path == "cmdline.txt") {
+                // modify cmdline.txt
+                std::ifstream f(entry.path());
+                std::string cmdline;
+                std::getline(f, cmdline);
+                // replace "ROOTDEV" to "systemimg:auto"
+                cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)root=[^ ]*)"), "$1root=systemimg:auto");
+                // remove "rootfstype=..."
+                cmdline = std::regex_replace(cmdline, std::regex(R"((^|\s)rootfstype=[^ ]*)"), "");
+                // write modified cmdline.txt to zip
+                add_text_to_zip(zf, cmdline, relative_path);
+                continue;
             }
-            std::cout << "Done." << std::endl;
+            // else 
+            add_file_to_zip(zf, entry.path(), std::filesystem::relative(entry.path(), tempdir_path_boot).string());
         }
+        std::cout << "Done." << std::endl;
     }
 
-    if (additional_boot_files) {
+    if (options.additional_boot_files) {
         std::cout << "Extracting additional boot files..." << std::endl;
         throw std::runtime_error("Not implemented yet.");
     }
 
     zipClose(zf, nullptr);
-    return 0;
 }
 
-bool are_files_same(const std::filesystem::path& file1, const std::filesystem::path& file2)
-{
-    if (std::filesystem::file_size(file1) != std::filesystem::file_size(file2)) return false;
-    //else
-    std::ifstream f1(file1, std::ios::binary);
-    std::ifstream f2(file2, std::ios::binary);
-    if (!f1 || !f2) {
-        if (debug) std::cout << "Failed to open file: " << file1 << " or " << file2 << std::endl;
-        return false;
-    }
-    char buf1[4096], buf2[4096];
-    while (true) {
-        f1.read(buf1, sizeof(buf1));
-        f2.read(buf2, sizeof(buf2));
-        std::streamsize bytes_read1 = f1.gcount();
-        std::streamsize bytes_read2 = f2.gcount();
-        if (bytes_read1 != bytes_read2 || memcmp(buf1, buf2, bytes_read1) != 0) {
-            return false;
-        }
-        if (bytes_read1 < sizeof(buf1)) break; // End of file reached
-    }
-    return f1.eof() && f2.eof();
-}
-
-int install_self(const std::filesystem::path& system_image,
-    const std::optional<std::filesystem::path>& system_cfg = std::nullopt, const std::optional<std::filesystem::path>& system_ini = std::nullopt)
-{
-    static const std::filesystem::path current_system_image(boot_partition / "system.cur");
-    static const std::filesystem::path old_system_image(boot_partition / "system.old");
-    static const std::filesystem::path new_system_image(boot_partition / "system.new");
-
-    if (!is_dir(boot_partition)) {
-        throw std::runtime_error(std::string("Boot partition is not mounted on ") + boot_partition.string());
-    }
-    check_system_image(system_image);
-    if (is_file(old_system_image)) {
-        std::filesystem::remove(old_system_image);
-        std::cout << "Old system image removed to preserve disk space." << std::endl;
-    }
-    std::cout << "Copying new system image..." << std::flush;
-    try {
-        std::filesystem::copy_file(system_image, new_system_image);
-        if (is_image_file_loopbacked(installed_system_image)) {
-            std::filesystem::rename(installed_system_image, current_system_image);
-            std::cout << "Original system image preserved..." << std::flush;
-        }
-        std::filesystem::rename(new_system_image, installed_system_image);
-    }
-    catch (const std::filesystem::filesystem_error& e) {
-        if (!std::filesystem::exists(installed_system_image)) {
-            if (is_file(current_system_image)) {
-                std::filesystem::rename(current_system_image, installed_system_image);
-                std::cout << "Original system image restored." << std::endl;
-            }
-        }
-        if (is_file(new_system_image)) std::filesystem::remove(new_system_image);
-        throw e;
-    }
-
-    {
-        // for raspberry pi, all files under /boot should be copied to boot partition
-        auto tempdir = create_tempmount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
-        auto tempdir_path = std::filesystem::path(tempdir.get());
-        if (is_file(tempdir_path / "boot" / "bootcode.bin")) {
-            // raspberry pi
-            std::cout << "Installing boot files for raspberry pi..." << std::endl;
-            // first, enum all files under tmpdir_path / "boot" recursively
-            std::vector<std::filesystem::path> files;
-            auto tempdir_path_boot = tempdir_path / "boot";
-            for (const auto& entry: std::filesystem::recursive_directory_iterator(tempdir_path_boot)) {
-                if (entry.is_directory()) {
-                    auto dst_dir = boot_partition / std::filesystem::relative(entry.path(), tempdir_path_boot);
-                    if (!std::filesystem::create_directories(dst_dir) && debug) {
-                        std::cout << "Directory not created: " << dst_dir << std::endl;
-                    }
-                } else if (entry.is_regular_file()) {
-                    files.push_back(entry.path());
-                }
-            }
-            // then, copy all files except config.txt and cmdline.txt to boot partition
-            for (const auto& file: files) {
-                std::filesystem::path relative_path = std::filesystem::relative(file, tempdir_path_boot);
-                if (relative_path == "config.txt" || relative_path == "cmdline.txt") continue;
-                auto dst_path = boot_partition / relative_path;
-                if (std::filesystem::exists(dst_path) && are_files_same(file, dst_path)) {
-                    if (debug) std::cout << "File already exists: " << dst_path << std::endl;
-                    continue;
-                }
-                // else
-                // copy file to dst_path + ".new" and then rename it to dst_path
-                std::filesystem::copy_file(file, dst_path.string() + ".new");
-                std::filesystem::rename(dst_path.string() + ".new", dst_path);
-                if (debug) std::cout << file << std::endl;
-            }
-            std::cout << "Done." << std::endl;
-        }
-    }
-
-    copy_system_cfg_ini(system_cfg, system_ini, boot_partition);
-
-    sync();
-
-    std::cout << "Done.  Reboot system to take effects." << std::endl;
-
-    return 0;
-}
-
-int show_examples(const std::string& progname)
+void show_examples(const std::string& progname)
 {
     std::cout << "Example:" << std:: endl;
     std::cout << ' ' << progname << ' ' << "<system image file>" << std::endl;
@@ -1064,11 +956,10 @@ int show_examples(const std::string& progname)
     std::cout << "or" << std::endl;
     std::cout << ' ' << progname << ' ' << "--disk=list" << std::endl;
     std::cout << "or" << std::endl;
-    std::cout << ' ' << progname << ' ' << "--disk=<iso image file> --cdrom [--label=<label>] [system image file]" << std::endl;
-    return 1;
+    std::cout << ' ' << progname << ' ' << "--cdrom=<iso image file> [--label=<label>] [system image file]" << std::endl;
 }
 
-int _main(int argc, char** argv)
+int main(int argc, char** argv)
 {
     const std::string progname = "genpack-install";
     argparse::ArgumentParser program(progname);
@@ -1115,15 +1006,19 @@ int _main(int argc, char** argv)
 
         if (!disk && !cdrom && !zip) {
             std::filesystem::path system_image = program.get<std::string>("system_image");
-            return install_self(system_image, 
-                program.present("--system-cfg"),
-                program.present("--system-ini"));
+            return install_self(system_image, {
+                .system_config = {
+                    .system_cfg = program.present("--system-cfg"),
+                    .system_ini = program.present("--system-ini")
+                }
+            });
         }
 
         //else
-        const auto& system_image = program.present("system_image").value_or(installed_system_image);
+        const auto system_image = program.present("system_image");
+        //std::cout << "System image: " << (system_image? program.get<std::string>("system_image") : "not specified") << std::endl;
 
-        std::optional<std::filesystem::path> system_cfg = program.present("--system-cfg")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-cfg"))) : std::nullopt;
+        auto system_cfg = program.present("--system-cfg")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-cfg"))) : std::nullopt;
         //std::cout << "System cfg: " << (system_cfg? system_cfg.value().string() : "not specified") << std::endl;
         std::optional<std::filesystem::path> system_ini = program.present("--system-ini")? std::make_optional(std::filesystem::path(program.get<std::string>("--system-ini"))) : std::nullopt;
         //std::cout << "System ini: " << (system_ini? system_ini.value().string() : "not specified") << std::endl;
@@ -1131,25 +1026,34 @@ int _main(int argc, char** argv)
 
         if (disk) {
             //std::cout << "Disk: " << disk << std::endl;
-            auto rst = install_to_disk(disk.value(), { 
-                system_image: system_image, 
-                data_partition: !program.get<bool>("--no-data-partition"), 
-                system_cfg: system_cfg, 
-                system_ini:system_ini, 
-                label:program.present("--label"), 
-                additional_boot_files:additional_boot_files,
-                yes:program.get<bool>("-y"), 
-                gpt:program.get<bool>("--gpt"),
+            if (disk == "list") {
+                print_installable_disks();
+                return 0;
+            }
+
+            install_to_disk(disk.value(), { 
+                .system_image = system_image,
+                .system_config = { .system_cfg = system_cfg, .system_ini = system_ini },
+                .label = program.present("--label"),
+                .additional_boot_files = additional_boot_files,
+                .data_partition = !program.get<bool>("--no-data-partition"), 
+                .prefer_gpt = program.get<bool>("--gpt"),
+                .yes = program.get<bool>("-y"), 
             });
-            if (rst != 0) return rst;
         }
         if (cdrom) {
-            auto rst = create_iso9660_image(cdrom.value(), system_image, system_cfg, system_ini, program.present("--label"), additional_boot_files);
-            if (rst != 0) return rst;
+            create_iso9660_image(cdrom.value(), {
+                .system_image = system_image,
+                .system_config = { .system_cfg = system_cfg, .system_ini = system_ini },
+                .label = program.present("--label"),
+            });
         }
         if (zip) {
-            auto rst = create_zip_archive(zip.value(), system_image, system_cfg, system_ini, additional_boot_files);
-            if (rst != 0) return rst;
+            create_zip_archive(zip.value(), {
+                .system_image = system_image,
+                .system_config = { .system_cfg = system_cfg, .system_ini = system_ini },
+                .additional_boot_files = additional_boot_files
+            });
         }
         return 0;
 
@@ -1160,24 +1064,3 @@ int _main(int argc, char** argv)
 
     return 1;
 }
-
-//#define TEST
-
-#ifdef TEST
-int test_main(int argc, char** argv)
-{
-    generate_efi_bootloader("bootx64.efi");
-    return 0;
-}
-#endif // TEST
-
-int main(int argc, char* argv[])
-{
-#ifndef TEST
-    return _main(argc, argv);
-#else
-    return test_main(argc, argv);
-#endif
-}
-
-// g++ -std=c++23 -o genpack-install genpack-install.cpp -lmount -lblkid
