@@ -39,16 +39,16 @@ genpack-install.bin: genpack-install.cpp
 	g++ -std=c++23 -o  $@ $< -lmount -lblkid -lminizip
 
 bootx64.efi: grub.cfg
-	grub-mkstandalone -O x86_64-efi -o $@ --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
+	grub-mkstandalone -O x86_64-efi -o $@ --compress=xz --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
 
 bootia32.efi: grub.cfg
-	grub-mkstandalone -O i386-efi -o $@ --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
+	grub-mkstandalone -O i386-efi -o $@ --compress=xz --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
 
 bootaa64.efi: grub.cfg
-	grub-mkstandalone -O arm64-efi -o $@ --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
+	grub-mkstandalone -O arm64-efi -o $@ --compress=xz --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
 
 bootriscv64.efi: grub.cfg
-	grub-mkstandalone -O riscv64-efi -o $@ --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
+	grub-mkstandalone -O riscv64-efi -o $@ --compress=xz --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
 
 boot.img:
 	cp /usr/lib/grub/i386-pc/boot.img .
