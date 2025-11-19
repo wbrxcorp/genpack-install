@@ -462,7 +462,7 @@ void install_self(const std::filesystem::path& system_image, const SelfOptions& 
     }
 }
 
-std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatibel*/> 
+std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatible*/> 
     create_partitions(const BlockDevice& disk, std::optional<size_t> boot_partition_size_in_gib = 4,
         bool gpt = false)
 {
@@ -535,15 +535,21 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
     return std::make_tuple(boot_partition_path.value(), data_partition_path, bios_compatible);
 }
 
-std::string format_fat32(const std::filesystem::path& path, const std::optional<std::string>& label = std::nullopt)
+std::string format_fat32(const std::filesystem::path& path, bool partition = true, const std::optional<std::string>& label = std::nullopt)
 {
     std::vector<std::string> mkfs_args = {"-F","32"};
+    if (!partition) {
+        mkfs_args.push_back("-I");
+    }
     if (label) {
         mkfs_args.push_back("-n");
         mkfs_args.push_back(label.value());
     }
     mkfs_args.push_back(path.string());
-    if (exec("mkfs.vfat",mkfs_args) != 0) throw std::runtime_error("Unable to format partition " + path.string() + " by FAT32");
+    if (exec("mkfs.vfat",mkfs_args) != 0) {
+        std::string object = partition? "partition " : "disk ";
+        throw std::runtime_error("Unable to format " + object + path.string() + " by FAT32");
+    }
     //else
     blkid_cache cache;
     if (blkid_get_cache(&cache, "/dev/null") != 0) throw std::runtime_error("blkid_get_cache() failed");
@@ -599,14 +605,18 @@ void print_installable_disks()
     }
 }
 
+struct Partitioning {
+    const bool prefer_gpt{};
+};
+
+using OptionalPartitioning = std::optional<Partitioning>;
 
 struct DiskOptions {
     const OptionalSystemImage& system_image{};
     const OptionalSystemConfig& system_config{};
     const OptionalLabel& label{};
     const OptionalAdditionalBootFiles& additional_boot_files{};
-    const bool data_partition{};
-    const bool prefer_gpt{};
+    const OptionalPartitioning& partition_options = Partitioning{false};
     const bool yes{};
 };
 
@@ -643,15 +653,26 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
     //else
     bool system_image_fits_boot_partition = system_image_size < 4 * 1024 * 1024 * 1024ULL;
 
-    auto data_partition = options.data_partition;
-    if (data_partition && disk_info.size / (1024 * 1024 * 1024) < least_capacity_needed_in_gib * 3 / 2) {
-        std::cout << "Disk size is not large enough to have data partition.  Applying --no-data-partition." << std::endl;
-        data_partition = false;
+    if (options.partition_options) {
+        if (disk_info.size / (1024 * 1024 * 1024) < least_capacity_needed_in_gib * 3 / 2) {
+            std::string msg = "Disk size is too small to create data partition along with boot partition.";
+            if (system_image_fits_boot_partition) {
+                msg += " Consider using --superfloppy to install without data partition.";
+            } else {
+                msg += " Consider using a larger disk or a system image smaller than 4GiB.";
+            }
+            throw std::runtime_error(msg);
+        }
+    } else {
+        // superfloppy mode
+        if (!system_image_fits_boot_partition) {
+            throw std::runtime_error("Cannot install system image larger than or equal to 4GiB to boot partition.");
+        }
+        // disk size must not be larger than (uint64_t)17592185872384 (16TiB - 16KiB)
+        if (disk_info.size > 17592185872384ULL) {
+            throw std::runtime_error("Disk size too large for superfloppy mode.");
+        }
     }
-    if (!system_image_fits_boot_partition && !data_partition) {
-        throw std::runtime_error("Cannot install system image larger than or equal to 4GiB to boot partition.");
-    }
-    //else
     auto boot_partition_size_in_gib = system_image_fits_boot_partition? least_capacity_needed_in_gib : 1; // 1 GiB boot partition for large system image with data partition
 
     std::cout << "Device path: " << disk << std::endl;
@@ -671,16 +692,22 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
     check_system_image(system_image);
     std::cout << "Looks OK." << std::endl;
 
-    std::cout << "Creating partitions..." << std::flush;
-    auto partitions = create_partitions(disk_info, data_partition? std::make_optional(boot_partition_size_in_gib) : std::nullopt, options.prefer_gpt);
-    std::cout << "Done." << std::endl;
+    if (options.partition_options) std::cout << "Creating partitions..." << std::flush;
+    auto partitions = options.partition_options?
+        create_partitions(disk_info, boot_partition_size_in_gib, options.partition_options->prefer_gpt)
+        : std::make_tuple(disk, std::nullopt, false);
+    if (options.partition_options) {
+        std::cout << "Done." << std::endl;
+    } else {
+        std::cout << "Superfloppy mode: no partition created." << std::endl;
+    }
 
     auto boot_partition_path = std::get<0>(partitions);
     auto data_partition_path = std::get<1>(partitions);
     auto bios_compatible = std::get<2>(partitions);
 
-    std::cout << "Formatting boot partition with FAT32" << std::endl;
-    auto boot_partition_uuid = format_fat32(boot_partition_path, options.label);
+    std::cout << "Formatting boot " + std::string(data_partition_path.has_value()? "partition" : "disk") + " with FAT32" << std::endl;
+    auto boot_partition_uuid = format_fat32(boot_partition_path, data_partition_path.has_value(), options.label);
     if (data_partition_path) {
         std::cout << "Formatting data partition with BTRFS..." << std::flush;
         format_btrfs(data_partition_path.value(), std::string("data-") + boot_partition_uuid);
@@ -688,7 +715,7 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
     }
 
     {
-        std::cout << "Mounting boot partition..." << std::flush;
+        std::cout << "Mounting boot " + std::string(data_partition_path.has_value()? "partition" : "disk") + "..." << std::flush;
         auto tempdir = TempMount("/tmp/genpack-install-", boot_partition_path, "vfat", MS_RELATIME, "fmask=177,dmask=077");
         std::cout << "Done." << std::endl;
 
@@ -971,8 +998,8 @@ int main(int argc, char** argv)
     program.add_argument("--system-cfg").help("Install specified system.cfg file");
     program.add_argument("--system-ini").help("Install specified system.ini file");
     program.add_argument("--label").help("Specify volume label of boot partition or iso9660 image");
-    program.add_argument("--no-data-partition").help("Use entire disk as boot partition").default_value(false).implicit_value(true);
     program.add_argument("--gpt").help("Always use GPT instead of MBR").default_value(false).implicit_value(true);
+    program.add_argument("--superfloppy").help("Use whole disk instead of partitioning").default_value(false).implicit_value(true);
     program.add_argument("--cdrom").help("Create iso9660 image");
     program.add_argument("--zip").help("Create zip-archived system directory");
     program.add_argument("--additional-boot-files").help("Zip-archived file contains additional boot files");
@@ -1039,8 +1066,8 @@ int main(int argc, char** argv)
                 .system_config = { .system_cfg = system_cfg, .system_ini = system_ini },
                 .label = program.present("--label"),
                 .additional_boot_files = additional_boot_files,
-                .data_partition = !program.get<bool>("--no-data-partition"), 
-                .prefer_gpt = program.get<bool>("--gpt"),
+                .partition_options = program.get<bool>("--superfloppy")? std::nullopt 
+                    : std::make_optional<Partitioning>(Partitioning{ .prefer_gpt = program.get<bool>("--gpt") }),
                 .yes = program.get<bool>("-y"), 
             });
         }
