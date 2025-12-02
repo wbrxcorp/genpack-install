@@ -7,6 +7,7 @@ system.img installer
 ### Build time
 
 - libmount-dev (debian)
+- libminizip-dev
 - [argparse](https://github.com/p-ranav/argparse)
 
 ### Runtime
