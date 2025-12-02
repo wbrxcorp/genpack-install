@@ -9,12 +9,12 @@ system.img installer
 - libmount-dev (debian)
 - libminizip-dev
 - [argparse](https://github.com/p-ranav/argparse)
+- dosfstools
+- mtools
+- grub
 
 ### Runtime
 
-- grub
-- mtools
-- dosfstools
 - xorriso
 - parted
 - btrfs-progs
