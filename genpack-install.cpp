@@ -464,7 +464,7 @@ void install_self(const std::filesystem::path& system_image, const SelfOptions& 
 
 std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios_compatible*/> 
     create_partitions(const BlockDevice& disk, std::optional<size_t> boot_partition_size_in_gib = 4,
-        bool gpt = false)
+        bool gpt = false, bool mark_boot_partition_as_esp = true)
 {
     std::vector<std::string> parted_args = {"--script", disk.path.string()};
     bool bios_compatible = !gpt && (disk.size <= 2199023255552L/*2TiB*/ && disk.log_sec == 512);
@@ -476,7 +476,7 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
         parted_args.push_back("mkpart primary fat32 1MiB -1");
     }
     parted_args.push_back("set 1 boot on");
-    if (bios_compatible && boot_partition_size_in_gib) {
+    if (bios_compatible && boot_partition_size_in_gib && mark_boot_partition_as_esp) {
         parted_args.push_back("set 1 esp on");
     }
     if (exec("parted", parted_args) != 0) throw std::runtime_error("Creating partition failed");
@@ -537,7 +537,10 @@ std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,bool/*bios
 
 std::string format_fat32(const std::filesystem::path& path, bool partition = true, const std::optional<std::string>& label = std::nullopt)
 {
-    std::vector<std::string> mkfs_args = {"-F","32"};
+    std::vector<std::string> mkfs_args = {
+        "-F","32",
+        "-s","32"
+    };
     if (!partition) {
         mkfs_args.push_back("-I");
     }
@@ -606,7 +609,8 @@ void print_installable_disks()
 }
 
 struct Partitioning {
-    const bool prefer_gpt{};
+    const bool prefer_gpt{false};
+    const bool mark_boot_partition_as_esp{true};
 };
 
 using OptionalPartitioning = std::optional<Partitioning>;
@@ -694,7 +698,7 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
 
     if (options.partition_options) std::cout << "Creating partitions..." << std::flush;
     auto partitions = options.partition_options?
-        create_partitions(disk_info, boot_partition_size_in_gib, options.partition_options->prefer_gpt)
+        create_partitions(disk_info, boot_partition_size_in_gib, options.partition_options->prefer_gpt, options.partition_options->mark_boot_partition_as_esp)
         : std::make_tuple(disk, std::nullopt, false);
     if (options.partition_options) {
         std::cout << "Done." << std::endl;
@@ -937,7 +941,7 @@ void create_zip_archive(const std::filesystem::path& output_zip, const ZipOption
     auto bootloader_path = get_bootloader_path(system_image_root);
     if (bootloader_path) {
         // add efi bootloaders
-
+        // TBD
     }
 
     // special treatment for raspberry pi
@@ -1000,6 +1004,7 @@ int main(int argc, char** argv)
     program.add_argument("--label").help("Specify volume label of boot partition or iso9660 image");
     program.add_argument("--gpt").help("Always use GPT instead of MBR").default_value(false).implicit_value(true);
     program.add_argument("--superfloppy").help("Use whole disk instead of partitioning").default_value(false).implicit_value(true);
+    program.add_argument("--no-esp").help("Don't mark boot partition as ESP (EFI System Partition) as some bootloaders dislike it").default_value(false).implicit_value(true);
     program.add_argument("--cdrom").help("Create iso9660 image");
     program.add_argument("--zip").help("Create zip-archived system directory");
     program.add_argument("--additional-boot-files").help("Zip-archived file contains additional boot files");
@@ -1066,8 +1071,11 @@ int main(int argc, char** argv)
                 .system_config = { .system_cfg = system_cfg, .system_ini = system_ini },
                 .label = program.present("--label"),
                 .additional_boot_files = additional_boot_files,
-                .partition_options = program.get<bool>("--superfloppy")? std::nullopt 
-                    : std::make_optional<Partitioning>(Partitioning{ .prefer_gpt = program.get<bool>("--gpt") }),
+                .partition_options = program.get<bool>("--superfloppy")? std::nullopt  // no partition options means superfloppy mode
+                    : std::make_optional<Partitioning>(Partitioning{ 
+                        .prefer_gpt = program.get<bool>("--gpt"),
+                        .mark_boot_partition_as_esp = !program.get<bool>("--no-esp")
+                    }),
                 .yes = program.get<bool>("-y"), 
             });
         }
