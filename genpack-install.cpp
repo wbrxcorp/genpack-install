@@ -9,6 +9,9 @@
 #include <filesystem>
 #include <cstring>
 #include <regex>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
 
 #include <ext/stdio_filebuf.h> // for __gnu_cxx::stdio_filebuf
 #include <libmount/libmount.h>
@@ -243,12 +246,22 @@ uintmax_t get_freespace(const std::filesystem::path& path)
     return space_info.available;
 }
 
-void check_system_image(const std::filesystem::path& system_image)
+struct SystemImageInfo {
+    // SBC images carry their own boot files and don't boot via EFI/BIOS
+    bool raspberrypi = false;
+    bool uboot_extlinux = false;
+    bool is_sbc() const { return raspberrypi || uboot_extlinux; }
+};
+
+SystemImageInfo check_system_image(const std::filesystem::path& system_image)
 {
     TempMount tempdir("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
     const auto genpack_dir = tempdir / ".genpack";
     if (!std::filesystem::is_directory(genpack_dir)) throw std::runtime_error("System image file doesn't contain .genpack directory");
-    if (!std::filesystem::exists(tempdir / "boot/bootcode.bin")) {
+    SystemImageInfo info;
+    info.raspberrypi = std::filesystem::exists(tempdir / "boot/bootcode.bin");
+    info.uboot_extlinux = std::filesystem::exists(tempdir / "boot/extlinux/extlinux.conf");
+    if (!info.raspberrypi) {
         // kernel and initramfs is mandatory unless it's raspberry pi image
         if (!std::filesystem::exists(tempdir / "boot/kernel")) throw std::runtime_error("System image file doesn't contain kernel image");
         if (!std::filesystem::exists(tempdir / "boot/initramfs")) throw std::runtime_error("System image file doesn't contain initramfs");
@@ -264,6 +277,37 @@ void check_system_image(const std::filesystem::path& system_image)
     };
     print_file("artifact");
     print_file("variant");
+    return info;
+}
+
+// enumerate files referenced by extlinux.conf (KERNEL/LINUX/INITRD/FDT/FDTOVERLAYS lines).
+// paths in extlinux.conf are absolute from the boot partition root, so they are
+// returned as relative paths to be resolved against both the image's /boot and
+// the boot partition.
+std::vector<std::filesystem::path> get_files_referenced_by_extlinux_conf(const std::filesystem::path& extlinux_conf)
+{
+    std::vector<std::filesystem::path> files;
+    std::ifstream f(extlinux_conf);
+    if (!f) throw std::runtime_error("Cannot open " + extlinux_conf.string());
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string keyword;
+        if (!(iss >> keyword)) continue;
+        std::transform(keyword.begin(), keyword.end(), keyword.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (keyword == "kernel" || keyword == "linux" || keyword == "initrd" || keyword == "fdt"
+            || keyword == "devicetree" || keyword == "fdtoverlays" || keyword == "devicetree-overlay") {
+            std::string path; // FDTOVERLAYS may carry multiple space-separated paths
+            while (iss >> path) {
+                auto rel = std::filesystem::path(path).relative_path();
+                if (std::find(files.begin(), files.end(), rel) == files.end()) files.push_back(rel);
+            }
+        } else if (keyword == "fdtdir") {
+            throw std::runtime_error("FDTDIR in extlinux.conf is not supported by genpack-install. Use FDT with an explicit path.");
+        }
+    }
+    if (files.empty()) throw std::runtime_error("extlinux.conf doesn't reference any kernel/initrd/fdt files");
+    return files;
 }
 
 std::filesystem::path get_installed_system_image_path()
@@ -328,8 +372,24 @@ std::optional<std::filesystem::path> get_bootloader_path(const std::filesystem::
     return std::nullopt;
 }
 
+// extract UUID from root=systemimg:<UUID> in /proc/cmdline (for self-update)
+std::optional<std::string> get_running_systemimg_uuid()
+{
+    std::ifstream f("/proc/cmdline");
+    if (!f) return std::nullopt;
+    std::string token;
+    while (f >> token) {
+        if (token.starts_with("root=systemimg:")) {
+            auto uuid = token.substr(15);
+            if (uuid != "auto" && !uuid.empty()) return uuid;
+        }
+    }
+    return std::nullopt;
+}
+
 void install_boot_files(const std::filesystem::path& system_image, const std::filesystem::path& boot_partition_path,
-    const std::optional<std::filesystem::path>& disk = std::nullopt)
+    const std::optional<std::filesystem::path>& disk = std::nullopt,
+    const std::optional<std::string>& boot_partition_uuid = std::nullopt)
 {
     TempMount system_image_root = TempMount("/tmp/genpack-install-", system_image, "auto", MS_RDONLY, "loop");
 
@@ -366,6 +426,40 @@ void install_boot_files(const std::filesystem::path& system_image, const std::fi
             //else
             std::filesystem::create_directories(dest_path.parent_path());
             std::filesystem::copy_file(entry.path(), dest_path, std::filesystem::copy_options::overwrite_existing);
+        }
+        std::cout << "Done." << std::endl;
+    }
+
+    // U-Boot extlinux(bootstd) boot files
+    if (auto conf_src = system_image_root / "boot/extlinux/extlinux.conf"; std::filesystem::exists(conf_src)) {
+        std::cout << "Installing boot files for U-Boot extlinux..." << std::endl;
+        for (const auto& rel: get_files_referenced_by_extlinux_conf(conf_src)) {
+            auto src = system_image_root / "boot" / rel;
+            if (!std::filesystem::exists(src)) throw std::runtime_error(rel.string() + " referenced by extlinux.conf does not exist in system image");
+            auto dest_path = boot_partition_path / rel;
+            std::filesystem::create_directories(dest_path.parent_path());
+            std::filesystem::copy_file(src, dest_path, std::filesystem::copy_options::overwrite_existing);
+        }
+        // existing extlinux.conf is preserved as it may contain user customizations
+        // (kernel/initrd/fdt filenames it points to are stable across updates)
+        auto conf_dest = boot_partition_path / "extlinux/extlinux.conf";
+        if (!std::filesystem::exists(conf_dest)) {
+            std::filesystem::create_directories(conf_dest.parent_path());
+            // root=systemimg:auto in the image is a generic fallback. bind it to this
+            // very boot partition at install time (the extlinux counterpart of grub.cfg's
+            // boot-time `probe -u`), so that other disks carrying a system.img don't get
+            // picked up by the initramfs's auto-scan.
+            if (boot_partition_uuid) {
+                std::ifstream in(conf_src);
+                std::stringstream ss;
+                ss << in.rdbuf();
+                auto content = std::regex_replace(ss.str(), std::regex(R"(root=systemimg:auto)"),
+                    "root=systemimg:" + *boot_partition_uuid);
+                std::ofstream out(conf_dest);
+                out << content;
+            } else {
+                std::filesystem::copy_file(conf_src, conf_dest);
+            }
         }
         std::cout << "Done." << std::endl;
     }
@@ -422,7 +516,9 @@ void install_self(const std::filesystem::path& system_image, const SelfOptions& 
     //else
     check_system_image(system_image);
 
-    install_boot_files(system_image, boot_partition);
+    // self-update: normally extlinux.conf already exists and is preserved, but if it
+    // has to be (re)created, bind it to the boot partition we are running from
+    install_boot_files(system_image, boot_partition, std::nullopt, get_running_systemimg_uuid());
 
     const std::filesystem::path replaced_system_image = system_image_dir / "system.cur";
     const std::filesystem::path new_system_image = system_image_dir / "system.new";
@@ -693,12 +789,21 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
     }
 
     std::cout << "Checking system image file..." << std::endl;
-    check_system_image(system_image);
+    auto image_info = check_system_image(system_image);
     std::cout << "Looks OK." << std::endl;
+
+    if (options.partition_options && image_info.is_sbc()) {
+        // SBC boot firmwares (RasPi, U-Boot without CONFIG_EFI_PARTITION) can only read plain MBR disks
+        if (options.partition_options->prefer_gpt)
+            throw std::runtime_error("GPT cannot be used with this system image (its boot firmware requires MBR)");
+        if (disk_info.size > 2199023255552L/*2TiB*/ || disk_info.log_sec != 512)
+            throw std::runtime_error("This disk requires GPT, which the boot firmware for this system image cannot read. Use a disk <=2TiB with 512-byte sectors.");
+    }
 
     if (options.partition_options) std::cout << "Creating partitions..." << std::flush;
     auto partitions = options.partition_options?
-        create_partitions(disk_info, boot_partition_size_in_gib, options.partition_options->prefer_gpt, options.partition_options->mark_boot_partition_as_esp)
+        create_partitions(disk_info, boot_partition_size_in_gib, options.partition_options->prefer_gpt,
+            options.partition_options->mark_boot_partition_as_esp && !image_info.is_sbc())
         : std::make_tuple(disk, std::nullopt, false);
     if (options.partition_options) {
         std::cout << "Done." << std::endl;
@@ -723,7 +828,8 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
         auto tempdir = TempMount("/tmp/genpack-install-", boot_partition_path, "vfat", MS_RELATIME, "fmask=177,dmask=077");
         std::cout << "Done." << std::endl;
 
-        install_boot_files(system_image, tempdir, bios_compatible? std::make_optional(disk) : std::nullopt);
+        install_boot_files(system_image, tempdir, bios_compatible? std::make_optional(disk) : std::nullopt,
+            boot_partition_uuid);
 
         if (options.system_config.system_cfg || options.system_config.system_ini) {
             std::cout << "Copying system config file..." << std::flush;
@@ -969,6 +1075,18 @@ void create_zip_archive(const std::filesystem::path& output_zip, const ZipOption
             // else 
             add_file_to_zip(zf, entry.path(), std::filesystem::relative(entry.path(), tempdir_path_boot).string());
         }
+        std::cout << "Done." << std::endl;
+    }
+
+    // U-Boot extlinux(bootstd) boot files
+    if (auto conf_src = system_image_root / "boot/extlinux/extlinux.conf"; std::filesystem::is_regular_file(conf_src)) {
+        std::cout << "Adding boot files for U-Boot extlinux..." << std::endl;
+        for (const auto& rel: get_files_referenced_by_extlinux_conf(conf_src)) {
+            auto src = system_image_root / "boot" / rel;
+            if (!std::filesystem::exists(src)) throw std::runtime_error(rel.string() + " referenced by extlinux.conf does not exist in system image");
+            add_file_to_zip(zf, src, rel.string());
+        }
+        add_file_to_zip(zf, conf_src, "extlinux/extlinux.conf");
         std::cout << "Done." << std::endl;
     }
 
