@@ -15,9 +15,15 @@
 
 namespace {
 
-// minizip writes plain 32bit ZIP archives here, so the whole archive has to
-// stay below 4GiB. Refuse up front rather than produce something unreadable.
+// minizip writes plain 32bit ZIP archives here, so every offset in the archive
+// has to stay below 4GiB. Refuse up front rather than produce something
+// unreadable.
 const uint64_t zip_size_limit = 4ULL * 1024 * 1024 * 1024;
+
+// Sizes of the fixed parts of the ZIP structures, from APPNOTE.TXT.
+const uint64_t zip_local_file_header_size = 30;
+const uint64_t zip_central_directory_header_size = 46;
+const uint64_t zip_end_of_central_directory_size = 22;
 
 const std::string system_image_zip_path = "system.img";
 
@@ -173,11 +179,23 @@ void create_zip_archive(const std::filesystem::path& output_zip,
         }, "--add");
     }
 
-    uint64_t total = 0;
-    for (const auto& entry:entries) total += entry.size;
-    if (total >= zip_size_limit) {
-        throw std::runtime_error("Total size of the files to archive is " + size_str(total)
-            + ", which does not fit in a ZIP archive without ZIP64. Refusing to continue.");
+    std::vector<std::string> destinations;
+    for (const auto& entry:entries) destinations.push_back(entry.name);
+    check_dest_hierarchy(destinations);
+
+    // The content alone is not the whole archive: each entry carries a local
+    // header and a central directory record, and deflate grows data that is
+    // already compressed. Bound the worst case rather than the input size.
+    uint64_t worst_case = zip_end_of_central_directory_size;
+    for (const auto& entry:entries) {
+        worst_case += zip_local_file_header_size + entry.name.size();
+        worst_case += zip_central_directory_header_size + entry.name.size();
+        worst_case += compressBound(entry.size);
+    }
+    if (worst_case >= zip_size_limit) {
+        throw std::runtime_error("The archive could reach " + size_str(worst_case)
+            + " in the worst case, which does not fit in a ZIP archive without ZIP64."
+            " Refusing to continue.");
     }
 
     std::cout << "Creating ZIP archive..." << std::endl;

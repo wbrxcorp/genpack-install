@@ -102,6 +102,28 @@ TEST_CASE("parse_add_options")
         CHECK_THROWS(parse_add_options({"x=" + (tempdir / "missing").string()}));
         CHECK_THROWS(parse_add_options({"x=" + tempdir.path().string()}));   // a directory
     }
+
+    SUBCASE("makes the source absolute, because libisofs rejects relative paths") {
+        auto previous = std::filesystem::current_path();
+        std::filesystem::current_path(tempdir.path());
+        auto files = parse_add_options({"x=source.txt"});
+        std::filesystem::current_path(previous);
+        REQUIRE(files.size() == 1);
+        CHECK(files[0].src.is_absolute());
+        CHECK(same_file(files[0].src, src));
+    }
+}
+
+TEST_CASE("check_dest_hierarchy rejects a name used as both file and directory")
+{
+    CHECK_NOTHROW(check_dest_hierarchy({}));
+    CHECK_NOTHROW(check_dest_hierarchy({"system.img", "boot/grub/grub.cfg", "boot/grub/i386-pc/boot.cat"}));
+    CHECK_NOTHROW(check_dest_hierarchy({"a/b", "a/c", "ab"}));   // a shared prefix is not a conflict
+
+    CHECK_THROWS(check_dest_hierarchy({"system.img", "system.img/child"}));
+    CHECK_THROWS(check_dest_hierarchy({"system.img/child", "system.img"}));   // either order
+    CHECK_THROWS(check_dest_hierarchy({"a/b/c", "a"}));                       // not just the direct parent
+    CHECK_THROWS(check_dest_hierarchy({"boot/grub/grub.cfg", "boot/grub"}));
 }
 
 TEST_CASE("same_file sees through symlinks and hard links")

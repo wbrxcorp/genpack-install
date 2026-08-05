@@ -21,7 +21,7 @@ bool same_file(const std::filesystem::path& a, const std::filesystem::path& b);
 // A file placed into the generated image by --add=DEST=SRC
 struct AddFile {
     std::string dest;           // path inside the image, normalized and relative to its root
-    std::filesystem::path src;  // local regular file to read the content from
+    std::filesystem::path src;  // local regular file to read the content from, as an absolute path
 };
 
 // Turns a user-supplied destination into a normalized image-relative path.
@@ -30,8 +30,14 @@ std::string normalize_dest(const std::string& dest);
 
 // Parses --add=DEST=SRC specifications. DEST is split off at the first '='
 // because a local SRC path may well contain one. Later specifications win over
-// earlier ones targeting the same destination, with a warning.
+// earlier ones targeting the same destination, with a warning. SRC is made
+// absolute, since libisofs only accepts absolute paths.
 std::vector<AddFile> parse_add_options(const std::vector<std::string>& specs);
+
+// Rejects a set of destinations in which one is a directory prefix of another,
+// e.g. "system.img" together with "system.img/child". No filesystem can hold
+// both, and which of the two to drop is not ours to guess.
+void check_dest_hierarchy(const std::vector<std::string>& dests);
 
 // A directory removed along with its contents when it goes out of scope.
 class TempDirectory {
