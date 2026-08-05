@@ -5,7 +5,10 @@ PREFIX ?= /usr/local
 # images does not have to carry libisofs or minizip.
 TOOLS ?= install iso zip
 
-CXXFLAGS ?= -std=c++23 -O2
+# Kept out of CXXFLAGS so that it survives the environment overriding those,
+# which is what portage does.
+CXXSTD := -std=c++23
+CXXFLAGS ?= -O2
 
 # Deferred on purpose: pkg-config is only run for the libraries the selected
 # TOOLS actually need.
@@ -13,6 +16,9 @@ ISOFS_CFLAGS = $(shell pkg-config --cflags libisofs-1)
 ISOFS_LIBS = $(shell pkg-config --libs libisofs-1)
 SQFS_CFLAGS = $(shell pkg-config --cflags libsquashfs1)
 SQFS_LIBS = $(shell pkg-config --libs libsquashfs1)
+# zlib is needed directly for compressBound(), not just through minizip
+ZIP_CFLAGS = $(shell pkg-config --cflags minizip zlib)
+ZIP_LIBS = $(shell pkg-config --libs minizip zlib)
 
 MODULES := part_msdos part_gpt fat
 EMBED_MODULES := $(MODULES) normal regexp loopback xfs btrfs exfat ntfscomp ext2 iso9660 lvm squash4 \
@@ -67,23 +73,24 @@ TARGETS := $(TOOL_TARGETS) $(BOOTLOADER_TARGETS)
 all: $(TARGETS)
 
 %.o: %.cpp
-	g++ $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXSTD) $(CXXFLAGS) -c -o $@ $<
 
 genpack-install.bin: genpack-install.o $(IMAGE_OBJS) $(COMMON_OBJS)
-	g++ -o $@ $^ -lmount -lblkid $(SQFS_LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ -lmount -lblkid $(SQFS_LIBS)
 
 genpack-mkiso.bin: genpack-mkiso.o iso.o $(IMAGE_OBJS) $(COMMON_OBJS)
-	g++ -o $@ $^ $(ISOFS_LIBS) $(SQFS_LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(ISOFS_LIBS) $(SQFS_LIBS)
 
 genpack-mkzip.bin: genpack-mkzip.o zip.o $(IMAGE_OBJS) $(COMMON_OBJS)
-	g++ -o $@ $^ -lminizip $(SQFS_LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(ZIP_LIBS) $(SQFS_LIBS)
 
 image.o iso.o zip.o genpack-install.o: CXXFLAGS += $(SQFS_CFLAGS)
 iso.o: CXXFLAGS += $(ISOFS_CFLAGS)
+zip.o: CXXFLAGS += $(ZIP_CFLAGS)
 
 # Unit tests for the shared code. Not part of `all`, not installed.
 tests.bin: tests.o $(IMAGE_OBJS) $(COMMON_OBJS)
-	g++ -o $@ $^ $(SQFS_LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(SQFS_LIBS)
 
 tests.o: CXXFLAGS += $(SQFS_CFLAGS)
 

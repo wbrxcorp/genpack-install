@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 
 #include "common.hpp"
@@ -127,9 +128,24 @@ std::vector<AddFile> parse_add_options(const std::vector<std::string>& specs)
                 << duplicate->src.string() << " is superseded by " << src.string() << "." << std::endl;
             files.erase(duplicate);
         }
-        files.push_back(AddFile { dest, src });
+        files.push_back(AddFile { dest, std::filesystem::absolute(src) });
     }
     return files;
+}
+
+void check_dest_hierarchy(const std::vector<std::string>& dests)
+{
+    std::set<std::string> known(dests.begin(), dests.end());
+    for (const auto& dest:dests) {
+        // no proper ancestor of a destination may be a destination itself
+        for (auto slash = dest.find('/'); slash != std::string::npos; slash = dest.find('/', slash + 1)) {
+            auto ancestor = dest.substr(0, slash);
+            if (known.contains(ancestor)) {
+                throw std::runtime_error("Cannot place both " + ancestor + " and " + dest
+                    + ": " + ancestor + " would have to be a file and a directory at the same time");
+            }
+        }
+    }
 }
 
 TempDirectory::TempDirectory(const std::string& prefix)
