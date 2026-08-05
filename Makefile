@@ -62,6 +62,8 @@ endif
 
 TARGETS := $(TOOL_TARGETS) $(BOOTLOADER_TARGETS)
 
+.PHONY: all test install clean
+
 all: $(TARGETS)
 
 %.o: %.cpp
@@ -79,8 +81,18 @@ genpack-mkzip.bin: genpack-mkzip.o zip.o $(IMAGE_OBJS) $(COMMON_OBJS)
 image.o iso.o zip.o genpack-install.o: CXXFLAGS += $(SQFS_CFLAGS)
 iso.o: CXXFLAGS += $(ISOFS_CFLAGS)
 
+# Unit tests for the shared code. Not part of `all`, not installed.
+tests.bin: tests.o $(IMAGE_OBJS) $(COMMON_OBJS)
+	g++ -o $@ $^ $(SQFS_LIBS)
+
+tests.o: CXXFLAGS += $(SQFS_CFLAGS)
+
+test: tests.bin
+	./tests.bin
+
 common.o: common.cpp common.hpp
 image.o: image.cpp image.hpp
+tests.o: tests.cpp common.hpp image.hpp
 iso.o: iso.cpp iso.hpp image.hpp common.hpp
 zip.o: zip.cpp zip.hpp image.hpp common.hpp
 genpack-install.o: genpack-install.cpp image.hpp common.hpp
@@ -127,5 +139,9 @@ ifneq ($(filter zip,$(TOOLS)),)
 	install -D -m 755 genpack-mkzip.bin $(DESTDIR)$(PREFIX)/bin/genpack-mkzip
 endif
 
+# Named explicitly rather than globbed: *.img and *.efi would also take out
+# unrelated files people keep in a working copy, such as a scratch disk image.
 clean:
-	rm -f *.o *.bin *.efi *.img
+	rm -f *.o genpack-install.bin genpack-mkiso.bin genpack-mkzip.bin tests.bin \
+	    boot.img core.img eltorito-bios.img eltorito-efi.img \
+	    bootx64.efi bootia32.efi bootaa64.efi bootriscv64.efi
