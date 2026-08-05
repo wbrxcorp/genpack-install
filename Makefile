@@ -1,5 +1,24 @@
 PREFIX ?= /usr/local
 
+# Which of the three tools to build and install. Mirrors the ebuild's
+# install/iso/zip USE flags, so an artifact that never generates ISO or ZIP
+# images does not have to carry libisofs or minizip.
+TOOLS ?= install iso zip
+
+# Kept out of CXXFLAGS so that it survives the environment overriding those,
+# which is what portage does.
+CXXSTD := -std=c++23
+CXXFLAGS ?= -O2
+
+# Deferred on purpose: pkg-config is only run for the libraries the selected
+# TOOLS actually need.
+ISOFS_CFLAGS = $(shell pkg-config --cflags libisofs-1)
+ISOFS_LIBS = $(shell pkg-config --libs libisofs-1)
+SQFS_CFLAGS = $(shell pkg-config --cflags libsquashfs1)
+SQFS_LIBS = $(shell pkg-config --libs libsquashfs1)
+ZIP_CFLAGS = $(shell pkg-config --cflags minizip)
+ZIP_LIBS = $(shell pkg-config --libs minizip)
+
 MODULES := part_msdos part_gpt fat
 EMBED_MODULES := $(MODULES) normal regexp loopback xfs btrfs exfat ntfscomp ext2 iso9660 lvm squash4 \
        msdospart blocklist configfile linux chain echo test probe search minicmd sleep \
@@ -31,12 +50,61 @@ ifneq ($(EFI_TARGETS),)
 endif
 
 BOOTLOADER_TARGETS += $(EFI_TARGETS)
-TARGETS := genpack-install.bin $(BOOTLOADER_TARGETS)
+
+COMMON_OBJS := common.o
+IMAGE_OBJS := image.o
+
+TOOL_TARGETS :=
+ifneq ($(filter install,$(TOOLS)),)
+	TOOL_TARGETS += genpack-install.bin
+endif
+ifneq ($(filter iso,$(TOOLS)),)
+	TOOL_TARGETS += genpack-mkiso.bin
+endif
+ifneq ($(filter zip,$(TOOLS)),)
+	TOOL_TARGETS += genpack-mkzip.bin
+endif
+
+TARGETS := $(TOOL_TARGETS) $(BOOTLOADER_TARGETS)
+
+.PHONY: all test install clean
 
 all: $(TARGETS)
 
-genpack-install.bin: genpack-install.cpp
-	g++ -std=c++23 -o  $@ $< -lmount -lblkid -lminizip
+# The per-dependency include flags are deliberately not kept in CXXFLAGS: a
+# command line assignment, which is how portage passes it, outranks any
+# target-specific += on the same variable and would drop them.
+%.o: %.cpp
+	$(CXX) $(CXXSTD) $(CPPFLAGS) $(PKG_CFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+genpack-install.bin: genpack-install.o $(IMAGE_OBJS) $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ -lmount -lblkid $(SQFS_LIBS)
+
+genpack-mkiso.bin: genpack-mkiso.o iso.o $(IMAGE_OBJS) $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(ISOFS_LIBS) $(SQFS_LIBS)
+
+genpack-mkzip.bin: genpack-mkzip.o zip.o $(IMAGE_OBJS) $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(ZIP_LIBS) $(SQFS_LIBS)
+
+image.o iso.o zip.o genpack-install.o tests.o: PKG_CFLAGS += $(SQFS_CFLAGS)
+iso.o: PKG_CFLAGS += $(ISOFS_CFLAGS)
+zip.o: PKG_CFLAGS += $(ZIP_CFLAGS)
+
+# Unit tests for the shared code. Not part of `all`, not installed.
+tests.bin: tests.o $(IMAGE_OBJS) $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(SQFS_LIBS)
+
+test: tests.bin
+	./tests.bin
+
+common.o: common.cpp common.hpp
+image.o: image.cpp image.hpp
+tests.o: tests.cpp common.hpp image.hpp
+iso.o: iso.cpp iso.hpp image.hpp common.hpp
+zip.o: zip.cpp zip.hpp image.hpp common.hpp
+genpack-install.o: genpack-install.cpp image.hpp common.hpp
+genpack-mkiso.o: genpack-mkiso.cpp iso.hpp common.hpp
+genpack-mkzip.o: genpack-mkzip.cpp zip.hpp common.hpp
 
 bootx64.efi: grub.cfg
 	grub-mkstandalone -O x86_64-efi -o $@ --compress=xz --modules="$(MODULES)" "boot/grub/grub.cfg=grub.cfg"
@@ -68,7 +136,19 @@ eltorito-efi.img: $(EFI_TARGETS)
 install: $(TARGETS)
 	mkdir -p $(DESTDIR)$(PREFIX)/lib/genpack-install/
 	install -m 644 $(BOOTLOADER_TARGETS) grub.cfg $(DESTDIR)$(PREFIX)/lib/genpack-install/
+ifneq ($(filter install,$(TOOLS)),)
 	install -D -m 755 genpack-install.bin $(DESTDIR)$(PREFIX)/bin/genpack-install
+endif
+ifneq ($(filter iso,$(TOOLS)),)
+	install -D -m 755 genpack-mkiso.bin $(DESTDIR)$(PREFIX)/bin/genpack-mkiso
+endif
+ifneq ($(filter zip,$(TOOLS)),)
+	install -D -m 755 genpack-mkzip.bin $(DESTDIR)$(PREFIX)/bin/genpack-mkzip
+endif
 
+# Named explicitly rather than globbed: *.img and *.efi would also take out
+# unrelated files people keep in a working copy, such as a scratch disk image.
 clean:
-	rm -f *.o *.bin *.efi *.img
+	rm -f *.o genpack-install.bin genpack-mkiso.bin genpack-mkzip.bin tests.bin \
+	    boot.img core.img eltorito-bios.img eltorito-efi.img \
+	    bootx64.efi bootia32.efi bootaa64.efi bootriscv64.efi
