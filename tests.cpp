@@ -274,7 +274,8 @@ struct ImageFixture {
     TempDirectory tempdir{"genpack-test-"};
     std::filesystem::path image;
 
-    explicit ImageFixture(bool with_genpack_dir = true, bool with_bootloader = true) {
+    explicit ImageFixture(bool with_genpack_dir = true, bool with_bootloader = true,
+        const std::optional<std::string>& extlinux_conf = std::nullopt) {
         auto root = tempdir / "root";
         if (with_genpack_dir) {
             write_file(root / ".genpack/artifact", "myartifact\n");
@@ -287,6 +288,7 @@ struct ImageFixture {
             write_file(root / "usr/lib/genpack-install/grub.cfg", "# grub config\n");
             write_file(root / "usr/lib/genpack-install/bootx64.efi", std::string(1000, 'E'));
         }
+        if (extlinux_conf) write_file(root / extlinux_conf_image_path, *extlinux_conf);
         std::filesystem::create_symlink("usr/lib", root / "lib");
         std::filesystem::create_symlink("kernel", root / "boot/kernel-link");
 
@@ -378,6 +380,64 @@ TEST_CASE("check_system_image")
         ImageFixture fixture(false);
         SystemImageReader image(fixture.image);
         CHECK_THROWS(check_system_image(image));
+    }
+}
+
+TEST_CASE("get_files_referenced_by_extlinux_conf")
+{
+    if (!command_available("gensquashfs")) {
+        MESSAGE("gensquashfs not found, skipping the extlinux.conf tests");
+        return;
+    }
+    using Paths = std::vector<std::filesystem::path>;
+
+    SUBCASE("collects every referenced file, keyword case and order aside") {
+        ImageFixture fixture(true, true,
+            "default genpack\n"
+            "label genpack\n"
+            "    KERNEL /kernel\n"
+            "    initrd /initramfs\n"
+            "    FDT /dtb/vendor/board.dtb\n"
+            "    fdtoverlays /dtb/vendor/a.dtbo /dtb/vendor/b.dtbo\n"   // several paths on one line
+            "    append root=systemimg:auto console=ttyS0\n");
+        SystemImageReader image(fixture.image);
+        CHECK(check_system_image(image).uboot_extlinux);
+        CHECK(get_files_referenced_by_extlinux_conf(image) == Paths{
+            "kernel", "initramfs", "dtb/vendor/board.dtb", "dtb/vendor/a.dtbo", "dtb/vendor/b.dtbo"
+        });
+    }
+
+    SUBCASE("paths come back relative, so they resolve against either root") {
+        ImageFixture fixture(true, true, "label l\n    linux /boot/../kernel\n");
+        SystemImageReader image(fixture.image);
+        for (const auto& path:get_files_referenced_by_extlinux_conf(image)) CHECK(path.is_relative());
+    }
+
+    SUBCASE("lists a file referenced twice only once") {
+        ImageFixture fixture(true, true, "label a\n    kernel /kernel\nlabel b\n    kernel /kernel\n");
+        SystemImageReader image(fixture.image);
+        CHECK(get_files_referenced_by_extlinux_conf(image) == Paths{"kernel"});
+    }
+
+    SUBCASE("rejects FDTDIR, whose contents cannot be enumerated from the config") {
+        ImageFixture fixture(true, true, "label l\n    kernel /kernel\n    fdtdir /dtb/vendor/\n");
+        SystemImageReader image(fixture.image);
+        CHECK_THROWS(get_files_referenced_by_extlinux_conf(image));
+    }
+
+    SUBCASE("rejects a config referencing nothing at all") {
+        ImageFixture fixture(true, true, "default genpack\nlabel genpack\n    append root=systemimg:auto\n");
+        SystemImageReader image(fixture.image);
+        CHECK_THROWS(get_files_referenced_by_extlinux_conf(image));
+    }
+
+    SUBCASE("an image without one is not flagged as extlinux") {
+        ImageFixture fixture;
+        SystemImageReader image(fixture.image);
+        auto info = check_system_image(image);
+        CHECK_FALSE(info.uboot_extlinux);
+        CHECK_FALSE(info.raspberrypi);
+        CHECK_FALSE(info.is_sbc());
     }
 }
 
