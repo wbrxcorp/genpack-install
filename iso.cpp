@@ -155,8 +155,12 @@ void map_file(IsoImage* image, const std::filesystem::path& local, const std::st
     if (iso_dir_get_node(dir, components.back().c_str(), &existing) == 1) {
         iso_node_remove(existing);
     }
+    // Every local file reaching libisofs goes through here, and libisofs only
+    // resolves absolute paths: a relative one comes back as "The file does not
+    // exist in the filesystem".
+    auto absolute_local = std::filesystem::absolute(local);
     IsoNode* node = nullptr;
-    check(iso_tree_add_new_node(image, dir, components.back().c_str(), local.c_str(), &node),
+    check(iso_tree_add_new_node(image, dir, components.back().c_str(), absolute_local.c_str(), &node),
         "iso_tree_add_new_node");
 }
 

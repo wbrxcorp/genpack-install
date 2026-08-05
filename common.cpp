@@ -162,7 +162,9 @@ TempDirectory::TempDirectory(const std::string& prefix)
     if (!mkdtemp(buf.data())) {
         throw std::runtime_error(std::string("mkdtemp() failed: ") + strerror(errno));
     }
-    dir = buf.data();
+    // absolute, so that what gets extracted here can be handed to libisofs
+    // whatever TMPDIR was set to
+    dir = std::filesystem::absolute(buf.data());
 }
 
 TempDirectory::~TempDirectory()
