@@ -16,9 +16,8 @@ ISOFS_CFLAGS = $(shell pkg-config --cflags libisofs-1)
 ISOFS_LIBS = $(shell pkg-config --libs libisofs-1)
 SQFS_CFLAGS = $(shell pkg-config --cflags libsquashfs1)
 SQFS_LIBS = $(shell pkg-config --libs libsquashfs1)
-# zlib is needed directly for compressBound(), not just through minizip
-ZIP_CFLAGS = $(shell pkg-config --cflags minizip zlib)
-ZIP_LIBS = $(shell pkg-config --libs minizip zlib)
+ZIP_CFLAGS = $(shell pkg-config --cflags minizip)
+ZIP_LIBS = $(shell pkg-config --libs minizip)
 
 MODULES := part_msdos part_gpt fat
 EMBED_MODULES := $(MODULES) normal regexp loopback xfs btrfs exfat ntfscomp ext2 iso9660 lvm squash4 \
