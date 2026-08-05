@@ -72,8 +72,11 @@ TARGETS := $(TOOL_TARGETS) $(BOOTLOADER_TARGETS)
 
 all: $(TARGETS)
 
+# The per-dependency include flags are deliberately not kept in CXXFLAGS: a
+# command line assignment, which is how portage passes it, outranks any
+# target-specific += on the same variable and would drop them.
 %.o: %.cpp
-	$(CXX) $(CXXSTD) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXSTD) $(CPPFLAGS) $(PKG_CFLAGS) $(CXXFLAGS) -c -o $@ $<
 
 genpack-install.bin: genpack-install.o $(IMAGE_OBJS) $(COMMON_OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ -lmount -lblkid $(SQFS_LIBS)
@@ -84,15 +87,13 @@ genpack-mkiso.bin: genpack-mkiso.o iso.o $(IMAGE_OBJS) $(COMMON_OBJS)
 genpack-mkzip.bin: genpack-mkzip.o zip.o $(IMAGE_OBJS) $(COMMON_OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(ZIP_LIBS) $(SQFS_LIBS)
 
-image.o iso.o zip.o genpack-install.o: CXXFLAGS += $(SQFS_CFLAGS)
-iso.o: CXXFLAGS += $(ISOFS_CFLAGS)
-zip.o: CXXFLAGS += $(ZIP_CFLAGS)
+image.o iso.o zip.o genpack-install.o tests.o: PKG_CFLAGS += $(SQFS_CFLAGS)
+iso.o: PKG_CFLAGS += $(ISOFS_CFLAGS)
+zip.o: PKG_CFLAGS += $(ZIP_CFLAGS)
 
 # Unit tests for the shared code. Not part of `all`, not installed.
 tests.bin: tests.o $(IMAGE_OBJS) $(COMMON_OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(SQFS_LIBS)
-
-tests.o: CXXFLAGS += $(SQFS_CFLAGS)
 
 test: tests.bin
 	./tests.bin
