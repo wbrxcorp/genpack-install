@@ -15,10 +15,12 @@
 
 namespace {
 
-// minizip writes plain 32bit ZIP archives here, so every offset in the archive
-// has to stay below 4GiB. Refuse up front rather than produce something
-// unreadable.
-const uint64_t zip_size_limit = 4ULL * 1024 * 1024 * 1024;
+// minizip writes plain 32bit ZIP archives here. Every limit a ZIP archive
+// without ZIP64 has is checked before anything is written, rather than
+// producing something no unpacker can read.
+const uint64_t zip_size_limit = 4ULL * 1024 * 1024 * 1024;   // 32bit offsets and sizes
+const size_t zip_max_entries = 65535;                        // 16bit entry count in the EOCD record
+const size_t zip_max_name_length = 65535;                    // 16bit file name length field
 
 // Sizes of the fixed parts of the ZIP structures, from APPNOTE.TXT.
 const uint64_t zip_local_file_header_size = 30;
@@ -204,19 +206,34 @@ void create_zip_archive(const std::filesystem::path& output_zip,
     for (const auto& entry:entries) destinations.push_back(entry.name);
     check_dest_hierarchy(destinations);
 
+    if (entries.size() > zip_max_entries) {
+        throw std::runtime_error("There are " + std::to_string(entries.size())
+            + " files to archive, more than the " + std::to_string(zip_max_entries)
+            + " a ZIP archive without ZIP64 can index.");
+    }
     // The content alone is not the whole archive: each entry carries a local
     // header and a central directory record, and deflate grows data that is
     // already compressed. Bound the worst case rather than the input size.
+    // Testing the running total inside the loop keeps it below two entries'
+    // worth of the limit, so the addition itself cannot overflow.
     uint64_t worst_case = zip_end_of_central_directory_size;
     for (const auto& entry:entries) {
+        if (entry.name.size() > zip_max_name_length) {
+            throw std::runtime_error("The name of " + entry.name + " is longer than the "
+                + std::to_string(zip_max_name_length) + " bytes a ZIP archive without ZIP64 allows.");
+        }
+        if (entry.size >= zip_size_limit) {
+            throw std::runtime_error(entry.name + " is " + size_str(entry.size)
+                + ", which a ZIP archive without ZIP64 cannot hold.");
+        }
         worst_case += zip_local_file_header_size + entry.name.size();
         worst_case += zip_central_directory_header_size + entry.name.size();
-        worst_case += compressBound(entry.size);
-    }
-    if (worst_case >= zip_size_limit) {
-        throw std::runtime_error("The archive could reach " + size_str(worst_case)
-            + " in the worst case, which does not fit in a ZIP archive without ZIP64."
-            " Refusing to continue.");
+        worst_case += deflate_bound(entry.size);
+        if (worst_case >= zip_size_limit) {
+            throw std::runtime_error("The archive could reach " + size_str(worst_case)
+                + " in the worst case, which does not fit in a ZIP archive without ZIP64."
+                " Refusing to continue.");
+        }
     }
 
     std::cout << "Creating ZIP archive..." << std::endl;

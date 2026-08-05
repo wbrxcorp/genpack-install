@@ -114,6 +114,24 @@ TEST_CASE("parse_add_options")
     }
 }
 
+TEST_CASE("deflate_bound stays in 64bit where zlib's compressBound would not")
+{
+    // same values zlib's compressBound() produces, but never truncated: its
+    // uLong is 32bit on ILP32 targets
+    CHECK(deflate_bound(0) == 13);
+    CHECK(deflate_bound(1) == 14);
+    CHECK(deflate_bound(4096) == 4110);
+    CHECK(deflate_bound(1024ULL * 1024 * 1024) == 1074069549);
+
+    // an entry of exactly 4GiB truncates to a bound of 13 bytes in 32bit
+    CHECK(deflate_bound(4ULL * 1024 * 1024 * 1024) == 4296278157ULL);
+    CHECK(deflate_bound(4ULL * 1024 * 1024 * 1024) > 4ULL * 1024 * 1024 * 1024);
+    // and the bound never comes out below its input
+    for (uint64_t size : {0ULL, 1ULL, 65535ULL, 1ULL << 32, 1ULL << 40}) {
+        CHECK(deflate_bound(size) >= size);
+    }
+}
+
 TEST_CASE("check_dest_hierarchy rejects a name used as both file and directory")
 {
     CHECK_NOTHROW(check_dest_hierarchy({}));

@@ -39,6 +39,12 @@ std::vector<AddFile> parse_add_options(const std::vector<std::string>& specs);
 // both, and which of the two to drop is not ours to guess.
 void check_dest_hierarchy(const std::vector<std::string>& dests);
 
+// Largest output deflate can produce for an input of the given size. Same
+// formula as zlib's compressBound(), but computed in 64bit: zlib takes and
+// returns uLong, which is 32bit on ILP32 targets, where an entry of 4GiB would
+// wrap around to a bound of 13 bytes.
+uint64_t deflate_bound(uint64_t size);
+
 // A directory removed along with its contents when it goes out of scope.
 class TempDirectory {
     std::filesystem::path dir;

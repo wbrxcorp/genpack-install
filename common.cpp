@@ -133,6 +133,11 @@ std::vector<AddFile> parse_add_options(const std::vector<std::string>& specs)
     return files;
 }
 
+uint64_t deflate_bound(uint64_t size)
+{
+    return size + (size >> 12) + (size >> 14) + (size >> 25) + 13;
+}
+
 void check_dest_hierarchy(const std::vector<std::string>& dests)
 {
     std::set<std::string> known(dests.begin(), dests.end());
