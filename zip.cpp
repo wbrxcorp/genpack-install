@@ -141,6 +141,8 @@ void create_zip_archive(const std::filesystem::path& output_zip,
         }
     }
 
+    reject_add_over(options.add_files, system_image_zip_path, system_image_zip_path);
+
     SystemImageReader image(system_image);
     check_system_image(image);
     if (options.require_clean_commit) require_clean_commit(image);

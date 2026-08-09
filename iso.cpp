@@ -207,6 +207,8 @@ void create_iso9660_image(const std::filesystem::path& output_image,
         }
     }
 
+    reject_add_over(options.add_files, system_image_iso_path, "/" + system_image_iso_path);
+
     SystemImageReader image(system_image);
     check_system_image(image);
     if (options.require_clean_commit) require_clean_commit(image);

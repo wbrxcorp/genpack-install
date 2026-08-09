@@ -104,6 +104,16 @@ std::string normalize_dest(const std::string& dest)
     return str;
 }
 
+void reject_add_over(const std::vector<AddFile>& add_files, const std::string& dest, const std::string& display)
+{
+    for (const auto& add_file:add_files) {
+        if (add_file.dest == dest) {
+            throw std::runtime_error("--add cannot replace " + display + ", which holds the system image given"
+                " on the command line. Pass the image you want as the positional argument instead.");
+        }
+    }
+}
+
 std::vector<AddFile> parse_add_options(const std::vector<std::string>& specs)
 {
     std::vector<AddFile> files;

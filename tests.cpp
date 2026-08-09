@@ -385,6 +385,24 @@ TEST_CASE("check_system_image")
     }
 }
 
+TEST_CASE("reject_add_over")
+{
+    const std::string dest = "system.img";
+    auto add = [](const std::string& d) { return AddFile { d, "/tmp/whatever" }; };
+
+    SUBCASE("refuses an --add aimed at the reserved destination") {
+        CHECK_THROWS(reject_add_over({add("system.img")}, dest, "/system.img"));
+        CHECK_THROWS(reject_add_over({add("system.cfg"), add("system.img")}, dest, "/system.img"));
+    }
+    SUBCASE("leaves every other destination alone") {
+        CHECK_NOTHROW(reject_add_over({}, dest, "/system.img"));
+        CHECK_NOTHROW(reject_add_over({add("system.cfg"), add("system.ini")}, dest, "/system.img"));
+        // near misses: the comparison is on the whole normalized path
+        CHECK_NOTHROW(reject_add_over({add("system.img2")}, dest, "/system.img"));
+        CHECK_NOTHROW(reject_add_over({add("boot/system.img")}, dest, "/system.img"));
+    }
+}
+
 TEST_CASE("is_clean_commit_id")
 {
     const std::string sha1 = "33f4562a1b9e8c7d6f5a4b3c2d1e0f9a8b7c6d5e";

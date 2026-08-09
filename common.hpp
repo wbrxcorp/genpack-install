@@ -28,6 +28,14 @@ struct AddFile {
 // Throws when the result would be empty or would escape the image root.
 std::string normalize_dest(const std::string& dest);
 
+// Throws when one of the --add destinations is dest. Overriding a path the tool
+// places itself is otherwise only warned about, but not for the system image:
+// the output would then hold an image other than the one named on the command
+// line, which is what the metadata printed for it, and what
+// --require-clean-commit vouched for, both describe. `display` is how the path
+// is written in the message, with the leading slash an ISO path carries.
+void reject_add_over(const std::vector<AddFile>& add_files, const std::string& dest, const std::string& display);
+
 // Parses --add=DEST=SRC specifications. DEST is split off at the first '='
 // because a local SRC path may well contain one. Later specifications win over
 // earlier ones targeting the same destination, with a warning. SRC is made
