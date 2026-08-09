@@ -275,12 +275,14 @@ struct ImageFixture {
     std::filesystem::path image;
 
     explicit ImageFixture(bool with_genpack_dir = true, bool with_bootloader = true,
-        const std::optional<std::string>& extlinux_conf = std::nullopt) {
+        const std::optional<std::string>& extlinux_conf = std::nullopt,
+        const std::optional<std::string>& commit_id = std::nullopt) {
         auto root = tempdir / "root";
         if (with_genpack_dir) {
             write_file(root / ".genpack/artifact", "myartifact\n");
             write_file(root / ".genpack/variant", "myvariant\n");
         }
+        if (commit_id) write_file(root / commit_id_image_path, *commit_id);
         write_file(root / "boot/kernel", "kernel");
         write_file(root / "boot/initramfs", "initramfs");
         write_file(root / "boot/overlays/some.dtbo", "dtbo");
@@ -380,6 +382,58 @@ TEST_CASE("check_system_image")
         ImageFixture fixture(false);
         SystemImageReader image(fixture.image);
         CHECK_THROWS(check_system_image(image));
+    }
+}
+
+TEST_CASE("is_clean_commit_id")
+{
+    const std::string sha1 = "33f4562a1b9e8c7d6f5a4b3c2d1e0f9a8b7c6d5e";
+    const std::string sha256(64, 'a');
+
+    SUBCASE("a lone object id is clean") {
+        CHECK(is_clean_commit_id(sha1));
+        CHECK(is_clean_commit_id(sha1 + "\n"));
+        CHECK(is_clean_commit_id("  " + sha1 + "  \n"));
+        CHECK(is_clean_commit_id(sha256));
+    }
+    SUBCASE("anything following the id means not clean") {
+        CHECK_FALSE(is_clean_commit_id(sha1 + " (with local changes)"));
+        CHECK_FALSE(is_clean_commit_id(sha1 + " anything at all"));
+        // the contract is "exactly one token", so a second line counts as well
+        CHECK_FALSE(is_clean_commit_id(sha1 + "\n" + sha1 + "\n"));
+    }
+    SUBCASE("an unfamiliar format is not clean, rather than assumed to be") {
+        CHECK_FALSE(is_clean_commit_id(""));
+        CHECK_FALSE(is_clean_commit_id("\n"));
+        CHECK_FALSE(is_clean_commit_id("33f4562"));                 // abbreviated
+        CHECK_FALSE(is_clean_commit_id(sha1 + "f"));                // wrong length
+        CHECK_FALSE(is_clean_commit_id(sha1.substr(0, 39) + "g"));  // not hex
+        CHECK_FALSE(is_clean_commit_id(sha1 + "-dirty"));           // git describe --dirty
+    }
+}
+
+TEST_CASE("require_clean_commit")
+{
+    if (!command_available("gensquashfs")) {
+        MESSAGE("gensquashfs not found, skipping the require_clean_commit tests");
+        return;
+    }
+    const std::string sha1 = "33f4562a1b9e8c7d6f5a4b3c2d1e0f9a8b7c6d5e";
+
+    SUBCASE("accepts an image recording a clean commit id") {
+        ImageFixture fixture(true, true, std::nullopt, sha1);
+        SystemImageReader image(fixture.image);
+        CHECK_NOTHROW(require_clean_commit(image));
+    }
+    SUBCASE("rejects an image built from a dirty working tree") {
+        ImageFixture fixture(true, true, std::nullopt, sha1 + " (with local changes)");
+        SystemImageReader image(fixture.image);
+        CHECK_THROWS(require_clean_commit(image));
+    }
+    SUBCASE("rejects an image recording no commit id at all") {
+        ImageFixture fixture;
+        SystemImageReader image(fixture.image);
+        CHECK_THROWS(require_clean_commit(image));
     }
 }
 

@@ -310,7 +310,43 @@ SystemImageInfo check_system_image(const SystemImageReader& image)
     };
     print_file("artifact");
     print_file("variant");
+    // printed whole, unlike the others: a commit id can be followed by " (with
+    // local changes)", and that suffix is the part worth seeing
+    if (image.is_regular_file(commit_id_image_path)) {
+        auto content = image.read_file(commit_id_image_path);
+        content.erase(0, content.find_first_not_of(" \t\r\n"));
+        content.erase(std::min(content.find('\n'), content.size()));
+        auto end = content.find_last_not_of(" \t\r");
+        if (end != std::string::npos) content.erase(end + 1);
+        std::cout << "commit-id: " << content << std::endl;
+    }
     return info;
+}
+
+bool is_clean_commit_id(const std::string& content)
+{
+    std::istringstream in(content);
+    std::string token, rest;
+    if (!(in >> token)) return false;   // empty
+    if (in >> rest) return false;       // anything follows the id, " (with local changes)" included
+    // SHA-1 or SHA-256, the two object id formats git has
+    if (token.size() != 40 && token.size() != 64) return false;
+    return std::all_of(token.begin(), token.end(),
+        [](unsigned char c) { return std::isxdigit(c); });
+}
+
+void require_clean_commit(const SystemImageReader& image)
+{
+    if (!image.is_regular_file(commit_id_image_path)) {
+        throw std::runtime_error(image.image_path().string() + " records no commit id, so it cannot be shown to come"
+            " from a clean working tree. Build the artifact with include_commit_id in its genpack.json5, or leave"
+            " --require-clean-commit off.");
+    }
+    //else
+    if (!is_clean_commit_id(image.read_file(commit_id_image_path))) {
+        throw std::runtime_error(image.image_path().string() + " does not record a clean commit id: it was built from"
+            " a working tree with uncommitted changes, or its commit id is in a format this tool does not recognize.");
+    }
 }
 
 std::vector<std::filesystem::path> get_files_referenced_by_extlinux_conf(const SystemImageReader& image)

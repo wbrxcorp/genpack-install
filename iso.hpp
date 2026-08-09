@@ -10,6 +10,7 @@
 struct ISO9660Options {
     std::optional<std::string> label;
     std::vector<AddFile> add_files;
+    bool require_clean_commit = false;
 };
 
 void create_iso9660_image(const std::filesystem::path& output_image,

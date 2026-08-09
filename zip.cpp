@@ -143,6 +143,7 @@ void create_zip_archive(const std::filesystem::path& output_zip,
 
     SystemImageReader image(system_image);
     check_system_image(image);
+    if (options.require_clean_commit) require_clean_commit(image);
 
     std::vector<ZipEntry> entries;
     put(entries, ZipEntry {

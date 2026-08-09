@@ -209,6 +209,7 @@ void create_iso9660_image(const std::filesystem::path& output_image,
 
     SystemImageReader image(system_image);
     check_system_image(image);
+    if (options.require_clean_commit) require_clean_commit(image);
 
     auto bootloader = BootloaderFiles::locate(image);
     if (!bootloader) throw std::runtime_error("No bootloader files found.");

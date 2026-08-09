@@ -202,6 +202,7 @@ using OptionalAdditionalBootFiles = std::optional<std::string>;
 
 struct SelfOptions {
     const OptionalSystemConfig& system_config{};
+    const bool require_clean_commit{false};
 };
 
 void install_bios_bootloader(const BootloaderFiles& bootloader,
@@ -347,6 +348,7 @@ void install_self(const std::filesystem::path& system_image, const SelfOptions& 
     //else
     SystemImageReader system_image_reader(system_image);
     check_system_image(system_image_reader);
+    if (options.require_clean_commit) require_clean_commit(system_image_reader);
 
     // self-update: normally extlinux.conf already exists and is preserved, but if it
     // has to be (re)created, bind it to the boot partition we are running from
@@ -550,6 +552,7 @@ struct DiskOptions {
     const OptionalAdditionalBootFiles& additional_boot_files{};
     const OptionalPartitioning& partition_options = Partitioning{false};
     const bool yes{};
+    const bool require_clean_commit{false};
 };
 
 void install_to_disk(const std::filesystem::path& disk, const DiskOptions& options = {})
@@ -612,18 +615,23 @@ void install_to_disk(const std::filesystem::path& disk, const DiskOptions& optio
     std::cout << "Disk size: " << size_str(disk_info.size) << std::endl;
     std::cout << "Logical sector size: " << disk_info.log_sec << " bytes" << std::endl;
 
+    // Before the prompt, so that what the image says about itself is on screen
+    // while the question is being answered -- image files tend to be called
+    // something like system.img, and the name alone does not say which build it
+    // is. With -y there is no prompt, but the output still lands in the log.
+    std::cout << "Checking system image file..." << std::endl;
+    SystemImageReader system_image_reader(system_image);
+    auto image_info = check_system_image(system_image_reader);
+    if (options.require_clean_commit) require_clean_commit(system_image_reader);
+    std::cout << "Looks OK." << std::endl;
+
     if (!options.yes) {
         std::string sure;
         std::cout << "All data present on " << disk << " will be lost. Are you sure? (y/n):" << std::flush;
         std::cin >> sure;
-        if (sure != "y" && sure != "yes" && sure != "Y") 
+        if (sure != "y" && sure != "yes" && sure != "Y")
             throw std::runtime_error("User aborted installation");
     }
-
-    std::cout << "Checking system image file..." << std::endl;
-    SystemImageReader system_image_reader(system_image);
-    auto image_info = check_system_image(system_image_reader);
-    std::cout << "Looks OK." << std::endl;
 
     if (options.partition_options && image_info.is_sbc()) {
         // SBC boot firmwares (RasPi, U-Boot without CONFIG_EFI_PARTITION) can only read plain MBR disks
@@ -719,6 +727,7 @@ int main(int argc, char** argv)
     program.add_argument("--superfloppy").help("Use whole disk instead of partitioning").default_value(false).implicit_value(true);
     program.add_argument("--no-esp").help("Don't mark boot partition as ESP (EFI System Partition) as some bootloaders dislike it").default_value(false).implicit_value(true);
     program.add_argument("--additional-boot-files").help("Zip-archived file contains additional boot files");
+    program.add_argument("--require-clean-commit").help("Refuse a system image that doesn't record the commit ID of a clean artifact working tree").default_value(false).implicit_value(true);
     program.add_argument("-y").help("Don't ask questions").default_value(false).implicit_value(true);
     program.add_argument("--debug").help("Show debug messages").default_value(false).implicit_value(true);
 
@@ -751,7 +760,8 @@ int main(int argc, char** argv)
                 .system_config = {
                     .system_cfg = program.present("--system-cfg"),
                     .system_ini = program.present("--system-ini")
-                }
+                },
+                .require_clean_commit = program.get<bool>("--require-clean-commit")
             });
             return 0;
         }
@@ -783,6 +793,7 @@ int main(int argc, char** argv)
                     .mark_boot_partition_as_esp = !program.get<bool>("--no-esp")
                 }),
             .yes = program.get<bool>("-y"),
+            .require_clean_commit = program.get<bool>("--require-clean-commit"),
         });
         return 0;
     }

@@ -54,6 +54,11 @@ public:
 inline const std::string extlinux_conf_image_path = "boot/extlinux/extlinux.conf";
 inline const std::string extlinux_conf_dest_path = "extlinux/extlinux.conf";
 
+// The artifact definition's git revision, recorded by genpack when the artifact
+// sets include_commit_id. Not to be confused with .genpack/timestamp.commit,
+// which is the Portage tree's commit.
+inline const std::string commit_id_image_path = ".genpack/commit-id";
+
 struct SystemImageInfo {
     // SBC images carry their own boot files and don't boot via EFI/BIOS
     bool raspberrypi = false;
@@ -62,8 +67,20 @@ struct SystemImageInfo {
 };
 
 // Throws unless the image looks like a genpack system image, and prints the
-// artifact and variant names it carries.
+// artifact and variant names and the commit id it carries.
 SystemImageInfo check_system_image(const SystemImageReader& image);
+
+// Whether the content of /.genpack/commit-id says the artifact's working tree
+// was clean when the image was built: exactly one whitespace-separated token,
+// and that token a hex string the length of a git object id. genpack appends
+// " (with local changes)" when it was not, but nothing here interprets that --
+// anything other than a lone object id, an unfamiliar format included, reads as
+// not clean, so that a format this does not know cannot pass for a clean build.
+bool is_clean_commit_id(const std::string& content);
+
+// Throws unless the image records a commit id and that id is clean. An image
+// built without include_commit_id carries no such file and does not pass.
+void require_clean_commit(const SystemImageReader& image);
 
 // Enumerates the files boot/extlinux/extlinux.conf refers to (KERNEL/LINUX/
 // INITRD/FDT/FDTOVERLAYS lines). Paths in extlinux.conf are absolute from the

@@ -7,6 +7,7 @@
 
 struct ZipOptions {
     std::vector<AddFile> add_files;
+    bool require_clean_commit = false;
 };
 
 void create_zip_archive(const std::filesystem::path& output_zip,

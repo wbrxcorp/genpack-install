@@ -15,6 +15,7 @@ int main(int argc, char** argv)
     program.add_argument("--add").metavar("DEST=SRC")
         .help("Put local file SRC into the archive as DEST. Can be given more than once")
         .default_value(std::vector<std::string>{}).append();
+    program.add_argument("--require-clean-commit").help("Refuse a system image that doesn't record the commit ID of a clean artifact working tree").default_value(false).implicit_value(true);
     program.add_argument("--debug").help("Show debug messages").default_value(false).implicit_value(true);
 
     try {
@@ -30,7 +31,8 @@ int main(int argc, char** argv)
 
     try {
         create_zip_archive(program.get<std::string>("output"), program.get<std::string>("system_image"), {
-            .add_files = parse_add_options(program.get<std::vector<std::string>>("--add"))
+            .add_files = parse_add_options(program.get<std::vector<std::string>>("--add")),
+            .require_clean_commit = program.get<bool>("--require-clean-commit")
         });
         return 0;
     }
